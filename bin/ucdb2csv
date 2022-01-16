@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+
+"""Convert ucdb file into csv"""
+
+import argparse
+import collections
+import datetime
+import logging
+import re
+import subprocess
+import sys
+import time
+
+logging.basicConfig()
+LOGGER = logging.getLogger()
+LOGGER.setLevel(logging.INFO)
+
+VCOVER_TOOL = "/arm/tools/mentor/questasim/2020.3_1/questasim/bin/vcover"
+
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser("Convert ucdb file into csv")
+
+    parser.add_argument("-i", "--in", dest="ifile", type=str, required=True,
+                        help="Input ucdb file")
+
+    parser.add_argument("-o", "--out", dest="ofile", type=str,
+                        help="Generated coverage report file, default name is cov_<YYYY-MM-DDTHH:MM:SS.ffffff>.log")
+
+    parser.add_argument("-c", "--covtype", dest="covtype", type=str, choices=["fcov", "asrt"], default="fcov",
+                        help="Select which type of coverage to dump, (default: %(default)s)")
+
+    parser.add_argument("-z", "--zero", dest="zero", action="store_true",
+                        help="Keep only results that are not hit")
+
+    parser.add_argument("-t", "--trim", dest="trim_hierarchy", action="store_true",
+                        help="Trim hierarchy levels, keep only leaf level and merge values")
+
+    parser.add_argument("--human", dest="human", action="store_true",
+                        help="Dump using human readable format instead of csv")
+
+    parser.add_argument("-v", "--verbose", dest="verbose_level", type=int, default=0,
+                        help="Verbosity level")
+
+    return parser.parse_args()
+
+class CoverageParser(object):
+    """Coverage-type agnostic base class"""
+    def __init__(self, trim_hierarchy):
+        self.trim_hierarchy = trim_hierarchy
+
+class FunctionalCoverageParser(CoverageParser):
+    """Class that handles functional coverage text report parsing and dump into csv."""
+
+    def __init__(self, trim_hierarchy):
+        super(FunctionalCoverageParser, self).__init__(trim_hierarchy)
+        self.covergroups_already_parsed = set()
+        self.current_covergroup = None
+        self.current_coverpoint = None
+        self.nb_covergroup_parsed = 0
+        self.nb_covergroup_merged = 0
+        self.nb_covergroup_ignored = 0
+        self.covergroups = {}
+
+    def parse_covergroup(self, match):
+        """
+        Retrieve covergroup name.
+        If trim_hierarchy is set, keep only leaf hierarchy instance and merge results.
+        """
+        current_covergroup_raw = match.group(1)
+        if current_covergroup_raw not in self.covergroups_already_parsed:
+            self.covergroups_already_parsed.add(current_covergroup_raw)
+            current_covergroup = "/".join(re.split(r"[/:]", current_covergroup_raw)[-2:]) if self.trim_hierarchy else current_covergroup_raw
+            self.current_covergroup = current_covergroup
+            if current_covergroup in self.covergroups:
+                self.nb_covergroup_merged += 1
+            else:
+                self.covergroups[current_covergroup] = {}
+            self.nb_covergroup_parsed += 1
+        else:
+            self.nb_covergroup_ignored += 1
+
+    def parse_coverpoint(self, match):
+        """Parse coverpoint name."""
+        if self.current_covergroup is not None:
+            current_coverpoint = match.group(1)
+            self.current_coverpoint = current_coverpoint
+            if current_coverpoint not in self.covergroups[self.current_covergroup]:
+                self.covergroups[self.current_covergroup][current_coverpoint] = collections.defaultdict(int)
+
+    def parse_bin(self, match):
+        """Parse coverbin name and associated hit count."""
+        if self.current_covergroup is not None:
+            current_bin = match.group(1)
+            count = match.group(2)
+            current_coverpoint = self.covergroups[self.current_covergroup][self.current_coverpoint]
+            if count == "E" or current_coverpoint[current_bin] == "E":
+                current_coverpoint[current_bin] = "E"
+            else:
+                current_coverpoint[current_bin] += int(count)
+
+    def parse_type(self, match): # pylint: disable=unused-argument
+        """Clear current covergroup when TYPE is parsed."""
+        self.current_covergroup = None
+
+    def parse(self, ifile, zero):
+        """Generate functional coverage text report from ucdb and retrieve covergoups, coverpoints and coverbins."""
+        lines = subprocess.check_output(["bash",
+                                         "-c",
+                                         ". /arm/tools/setup/init/sh && {0} report -cvg -details -nocompactcrossbins -showexcluded {1} {2}".format(
+                                                 VCOVER_TOOL,
+                                                 "-zero" if zero else "",
+                                                 ifile)],
+                                        universal_newlines=True).split("\n")
+
+        actions = ((re.compile(r"Covergroup instance \\*(\S+)"), self.parse_covergroup),
+                   (re.compile(r"Coverpoint (\S+)"), self.parse_coverpoint),
+                   (re.compile(r" bin (\S+)\s+(\d+|E)"), self.parse_bin),
+                   (re.compile(r"TYPE"), self.parse_type),
+                  )
+
+        for line in lines:
+            for regex, action in actions:
+                match = re.search(regex, line)
+                if match is not None:
+                    action(match)
+                    break
+
+        LOGGER.info("Covergroup(s) parsed: %s", self.nb_covergroup_parsed)
+        LOGGER.info("Covergroup(s) merged: %s", self.nb_covergroup_merged)
+        LOGGER.info("Covergroup(s) ignored: %s", self.nb_covergroup_ignored)
+
+    def dump_csv(self, ofile):
+        """
+        Write functional coverage results in csv format:
+            covergroup,coverpoint,bin,count
+            u_arb00.u_fcg_mth_l2_arb,fcp_U1T1_dos_prevention_disabled,slave__disabled,2253
+        """
+        with open(ofile, "w") as fout:
+            fout.write("covergroup,coverpoint,bin,count\n")
+            for covergroup, coverpoints in sorted(self.covergroups.items()):
+                covergroup = covergroup.lstrip("/") # Remove leading backslash
+                covergroup = covergroup.replace("/", ".") # Use dot as hierarchy level separator
+                for coverpoint, coverbins in sorted(coverpoints.items()):
+                    for coverbin, count in sorted(coverbins.items()):
+                        if "," in coverbin:
+                            coverbin = "\"" + coverbin + "\""
+                        fout.write(",".join((covergroup, coverpoint, coverbin, str(count))) + "\n")
+
+    def dump_human(self, ofile):
+        """
+        Write functional coverage results, one line per bin like:
+            covergroup/coverpoint/bin count
+            u_arb00.u_fcg_mth_l2_arb/fcp_U1T1_dos_prevention_disabled/slave__disabled 2253
+        """
+        with open(ofile, "w") as fout:
+            fout.write("covergroup/coverpoint/bin count\n")
+            for covergroup, coverpoints in sorted(self.covergroups.items()):
+                covergroup = covergroup.lstrip("/") # Remove leading backslash
+                covergroup = covergroup.replace("/", ".") # Use dot as hierarchy level separator
+                for coverpoint, coverbins in sorted(coverpoints.items()):
+                    for coverbin, count in sorted(coverbins.items()):
+                        fout.write("/".join((covergroup, coverpoint, coverbin)) + " " + str(count) + "\n")
+
+class AssertionCoverageParser(CoverageParser):
+    """Class that handles assertion coverage text report parsing and dump into csv."""
+
+    def __init__(self, trim_hierarchy):
+        super(AssertionCoverageParser, self).__init__(trim_hierarchy)
+        self.assertions_already_parsed = set()
+        self.nb_assertion_parsed = 0
+        self.nb_assertion_merged = 0
+        self.nb_assertion_ignored = 0
+        self.assertions = collections.defaultdict(int)
+
+    def parse_assertion(self, match):
+        """
+        Retrieve assertion name and hit count.
+        If trim_hierarchy is set, keep only leaf hierarchy instance and merge results.
+        """
+        current_assertion_raw = match[0]
+        if current_assertion_raw not in self.assertions_already_parsed:
+            self.assertions_already_parsed.add(current_assertion_raw)
+            current_assertion = "/".join(re.split(r"[/:]", current_assertion_raw)[-2:]) if self.trim_hierarchy else current_assertion_raw
+            self.nb_assertion_parsed += 1
+            if current_assertion in self.assertions:
+                self.nb_assertion_merged += 1
+                LOGGER.debug("Assertion merged: %s", current_assertion)
+            self.assertions[current_assertion] += int(match[1])
+        else:
+            self.nb_assertion_ignored += 1
+            LOGGER.debug("Assertion ignored: %s", current_assertion_raw)
+
+    def parse(self, ifile, zero):
+        """Generate assertion coverage text report from ucdb and retrieve assertions."""
+        lines = subprocess.check_output(["bash",
+                                         "-c",
+                                         ". /arm/tools/setup/init/sh && {0} report -assert -directive -details {1} {2}".format(
+                                                 VCOVER_TOOL,
+                                                 "-zero" if zero else "",
+                                                 ifile)],
+                                        universal_newlines=True)
+
+        matches = re.findall(re.compile(r"^(/\S+)\s+\S+\s+\S+\s+\S+\s+\S+\s+(\d+)", re.MULTILINE | re.DOTALL), lines) # Cover directives
+        matches += re.findall(re.compile(r"^(/\S+)\s+\S+\s+\S+\s+(\d+)", re.MULTILINE | re.DOTALL), lines) # Assertions
+
+        for match in matches:
+            self.parse_assertion(match)
+
+        LOGGER.info("Assertion(s) parsed: %s", self.nb_assertion_parsed)
+        LOGGER.info("Assertion(s) merged: %s", self.nb_assertion_merged)
+        LOGGER.info("Assertion(s) ignored: %s", self.nb_assertion_ignored)
+
+    def dump_csv(self, ofile):
+        """
+        Write assertion coverage results in csv format:
+            assertion,count
+            u_intf_dside_l2/zsva__dc0_dside_misc0_valid,9391674
+        """
+        with open(ofile, "w") as fout:
+            fout.write("assertion,count\n")
+            for assertion, count in sorted(self.assertions.items()):
+                assertion = assertion.lstrip("/") # Remove leading backslash
+                assertion = assertion.replace("/", ".") # Use dot as hierarchy level separator
+                if "," in assertion:
+                    assertion = "\"" + assertion + "\""
+                fout.write(",".join((assertion, str(count))) + "\n")
+
+    def dump_human(self, ofile):
+        """
+        Write assertion coverage results, one line per bin like:
+            assertion/coverpoint/bin count
+            u_arb00.u_fcg_mth_l2_arb/fcp_U1T1_dos_prevention_disabled/slave__disabled 2253
+        """
+        with open(ofile, "w") as fout:
+            fout.write("assertion count\n")
+            for assertion, count in sorted(self.assertions.items()):
+                assertion = assertion.lstrip("/") # Remove leading backslash
+                assertion = assertion.replace("/", ".") # Use dot as hierarchy level separator
+                fout.write(assertion + " " + str(count) + "\n")
+
+def main(args):
+    """Main function."""
+    if args.verbose_level > 0:
+        LOGGER.setLevel(logging.DEBUG)
+
+    convert_time = -time.time()
+
+    if args.covtype == "fcov":
+        cov_parser = FunctionalCoverageParser(args.trim_hierarchy)
+        ofile = args.ofile if args.ofile is not None else "fcov_" + datetime.datetime.utcnow().isoformat() + (".log" if args.human else ".csv")
+    elif args.covtype == "asrt":
+        cov_parser = AssertionCoverageParser(args.trim_hierarchy)
+        ofile = args.ofile if args.ofile is not None else "asrt_" + datetime.datetime.utcnow().isoformat() + (".log" if args.human else ".csv")
+
+    cov_parser.parse(args.ifile, args.zero)
+
+    if args.human:
+        cov_parser.dump_human(ofile)
+    else:
+        cov_parser.dump_csv(ofile)
+
+    LOGGER.info("File written: %s", ofile)
+
+    convert_time += time.time()
+
+    LOGGER.info("Conversion complete in %d s.", convert_time)
+
+    return 0
+
+if __name__ == "__main__":
+    arguments = parse_args()
+    sys.exit(main(arguments))

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+
+main () {
+    set -euo pipefail
+    # Ubuntu already provides an up-to-date version of Subversion.
+    if [[ "$(lsb_release --short --id)" != Ubuntu ]]; then
+        . /arm/tools/setup/lib/sh
+        module load core apache/subversion/1.9.4
+    fi
+    exec svn "$@"
+}
+
+main "$@"

@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# vi:ft=sh:ts=4:sw=4:et:
+
+set -euo pipefail
+
+REPOSITORY_NAME="genasm_mp_manifests"
+REPOSITORY_GERRIT_NAMESPACE="cpu/tools"
+REPOSITORY_GERRIT_URL="ssh://eu-gerrit-2.euhpc.arm.com:29418/${REPOSITORY_GERRIT_NAMESPACE}/${REPOSITORY_NAME}"
+
+print_help() {
+    printf '%s\n' "pull from or push to the genasm manifest repo"
+    printf 'Usage: %s [-h|--help] <action> <branch> <repo_dir>\n' "$(basename "$0")"
+    printf '\t%s\n' "<action>: pull or push"
+    printf '\t%s\n' "<branch>: which branch, ex: master, stable, refs/for/master"
+    printf '\t%s\n' "<repo_dir>: the repo directory, created for <pull> if it does not exist"
+    printf '\t%s\n' "-h, --help: print help message"
+}
+
+parse_args () {
+    positional_args=()
+    while test $# -gt 0
+    do
+        case "$1" in
+            -h | --help)
+                print_help
+                exit 0
+                ;;
+            *)
+                positional_args+=("$1")
+                ;;
+        esac
+        shift
+    done
+
+    if [[ ${#positional_args[@]} -ne 3 ]] ; then
+        printf 'inappropriate number of arguments\n'
+        printf 'Use --help for more information.\n'
+        exit 1
+    fi
+
+    action=${positional_args[0]}
+    branch=${positional_args[1]}
+    repo_dir=$(realpath "${positional_args[2]}")
+}
+
+pwd_is_manifest_git_dir () {
+    in_git_dir="$(git rev-parse --is-inside-work-tree 2>/dev/null)"
+    repo_name="$(basename -s .git "$(git config --get remote.origin.url)")"
+    [[ -n "${in_git_dir}" ]] && [[ "${repo_name}" == "${REPOSITORY_NAME}" ]]
+}
+
+pull_manifests () {
+    if [[ -n "$(find "${repo_dir}" -maxdepth 0 -type d -not -empty 2>/dev/null)" ]]; then
+        # non empty dir
+        pushd "${repo_dir}" > /dev/null
+        if ! pwd_is_manifest_git_dir ; then
+            printf '%s is not empty and is not %s git repo.\n' "${repo_dir}" "${REPOSITORY_NAME}"
+            exit 1
+        elif [[ -n "$(git status --untracked-files=all --porcelain)" ]] ; then
+            printf 'git repo at %s is not clean.\n' "${repo_dir}"
+            exit 1
+        else
+            git fetch
+            git checkout origin/"${branch}"
+        fi
+        popd > /dev/null
+    else
+        git clone --branch "${branch}" "${REPOSITORY_GERRIT_URL}" "${repo_dir}"
+    fi
+}
+
+push_manifests () {
+    pushd "${repo_dir}" > /dev/null
+
+    if ! pwd_is_manifest_git_dir ; then
+        printf '%s is not a %s repo.\n' "${repo_dir}" "${REPOSITORY_NAME}"
+        exit 1
+    fi
+
+    if [[ -n "$(git status --untracked-files=all --porcelain)" ]] ; then
+        # there are changes in the manifests repo, commit and push them
+        # use user.name and user.email and don't try to derive them
+        # git config user.useConfigOnly true
+        scp -p -P 29418 "$(whoami)@eu-gerrit-2.euhpc.arm.com:hooks/commit-msg" .git/hooks/
+        # # Use writable mirror for pushing. This overrides read-only mirror configured in global gitconfig.
+        git config --add url."ssh://eu-gerrit-2.euhpc.arm.com".pushInsteadOf "ssh://eu-gerrit-2.euhpc.arm.com"
+        git remote set-url origin ${REPOSITORY_GERRIT_URL}
+        git add --all
+        git commit -m 'Update model and plugins paths'
+        git push origin HEAD:"${branch}"
+    fi
+    popd > /dev/null
+}
+
+main () {
+    parse_args "$@"
+    if [[ "${action}" == "push" ]] ; then
+        push_manifests
+    else
+        pull_manifests
+    fi
+}
+
+main "$@"

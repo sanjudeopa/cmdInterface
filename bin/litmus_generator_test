@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+# -*- python -*-
+# vim: set syntax=python:
+
+"test programm to generate a Litmus Generator without launching the entire Popeye/GenASM-MP generator"
+
+import argparse
+from os import path
+from json import dump, dumps
+from time import time
+from lib_generator.generator_class import PopeyeRandom
+from lib_generator.litmus_generator import LitmusGenerator
+from lib_generator.gen_instr import GenInstrALU, GenInstrBARRIER, GenInstrBRANCH, GenInstrCOMMENT, GenInstrLS
+from lib_shared.arm2geninstr import Arm2GenInstr, Arm2GenInstrAsm
+from lib_shared.const_log import getStdoutLogger
+from lib_litmus.dummy_objects import DummyLayoutGenerator, DummyPeGenerator, DummyAddressGenerator, DummyConfig
+
+LOGGER = getStdoutLogger(__name__)
+
+def json_dumper(output_dir: str, filename: str, outdict: dict, sort_keys: bool = False) -> None:
+    "function dumpting a dictionary outdict to a file filename in json format"
+    assert path.exists(output_dir), f"The directory {output_dir} doesn't exist"
+
+    output_path = path.join(output_dir, filename)
+
+    assert not path.isfile(output_path), \
+        "File already exists, please delete it manually if you wish to dispose of it"
+
+    with open(output_path, 'w') as outfile:
+        dump(outdict, outfile, sort_keys=sort_keys, indent=4)
+
+def generate_scenario_environment(nb_of_agents_needed, nb_litmus_object):
+    "generate a small generation environment DummyLayoutGenerator + DummyPeGenerators + DummyAddressGenerators"
+    agent_l = []
+    layout_generator = DummyLayoutGenerator()
+    layout_generator.nb_litmus_object = nb_litmus_object
+    assert nb_litmus_object >= 0, "The number of litmus objects needs to be equal to or superior to 0"
+    for i in range(nb_of_agents_needed):
+        agent_name = f"CL0_CPU{i}"
+        layer_name = f"cool_layer{i}"
+        layout_generator.rw_agent_names.append(agent_name)
+        layout_generator.cpu_agent_names.append(agent_name)
+        layout_generator.memory_layers[agent_name] = layer_name
+        address_gen = DummyAddressGenerator(agent_name, layer_name)
+        agent_l.append(DummyPeGenerator(agent_name, address_gen))
+
+    return layout_generator, agent_l
+
+def test_scenario1(litmus_generator):
+    "Scenarion where one single sequence is asked for by both agents"
+    observation_dictionary = dict()
+    total_agents = len(litmus_generator.layout_generator.cpu_agent_names)
+    for agent_id, cpu_name in enumerate(litmus_generator.layout_generator.cpu_agent_names):
+        pre_access_l, instr_l, post_access_l = litmus_generator.get_sequence(cpu_name, agent_id, total_agents) # pylint: disable=unused-variable
+        observation_dictionary[cpu_name] = instr_l
+
+    return observation_dictionary
+
+def test_scenario2(litmus_generator, iterations, rand_gen):
+    """Scenario where 'iterations' consecutive sequences are asked for by one of the agents randomly
+    """
+    observation_dictionary = dict()
+
+    for i in range(iterations):
+        cpu_name = rand_gen.choice(litmus_generator.layout_generator.rw_agent_names)
+        pending_sequences_before = len(litmus_generator.pending_sequences)
+        completed_sequences_before = len(litmus_generator.completed_sequences)
+        pre_access_l, instr_l, post_access_l = litmus_generator.get_sequence(cpu_name, i, iterations) # pylint: disable=unused-variable
+        pending_sequences_after = len(litmus_generator.pending_sequences)
+        completed_sequences_after = len(litmus_generator.completed_sequences)
+        if completed_sequences_before < completed_sequences_after:
+            last_litmus = litmus_generator.completed_sequences[-1]
+        elif pending_sequences_before < pending_sequences_after:
+            last_litmus = litmus_generator.pending_sequences[-1]
+        elif pending_sequences_before == pending_sequences_after:
+            # in the case when an already existing pending sequence has been used
+            assert instr_l, "Something went wrong"
+        else:
+            raise RuntimeError("No litmus test generated ?!")
+
+        if cpu_name not in observation_dictionary:
+            observation_dictionary.update({cpu_name: dict()})
+            observation_dictionary[cpu_name]["calls"] = 0
+
+        # count nb of calls
+        observation_dictionary[cpu_name]["calls"] += 1
+        # gather every GenInstr short info
+        if i not in observation_dictionary[cpu_name]:
+            observation_dictionary[cpu_name].update({i: {}})
+            observation_dictionary[cpu_name][i]["test_name"] = last_litmus.litmus_d['name']
+            observation_dictionary[cpu_name][i]["instructions"] = []
+        for ginstr in instr_l:
+            if isinstance(ginstr, GenInstrCOMMENT):
+                continue
+
+            if isinstance(ginstr, GenInstrALU):
+                print_instruction_info = ginstr.operation
+            elif isinstance(ginstr, GenInstrLS):
+                if ginstr.can_write():
+                    print_instruction_info = "STORE"
+                    if ginstr.is_acq_rel():
+                        print_instruction_info += " RELEASE"
+                else:
+                    print_instruction_info = "LOAD"
+                    if ginstr.is_acq_rel():
+                        print_instruction_info += " ACQUIRE"
+
+                if ginstr.is_excl():
+                    print_instruction_info += " EX"
+            elif isinstance(ginstr, GenInstrBARRIER):
+                print_instruction_info = ginstr.op
+            elif isinstance(ginstr, GenInstrBRANCH):
+                print_instruction_info = "BRANCH"
+            else:
+                raise NotImplementedError(f"GenInstr: {ginstr} {instr_l} cannot be outputted correctly.\nPlease add an appropriate condition here!")
+            observation_dictionary[cpu_name][i]["instructions"].append(f"{print_instruction_info}")
+
+    return observation_dictionary
+
+def get_args():
+    "parses and returns the specified command line arguments"
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed",
+                        type=int)
+    parser.add_argument("-v", dest="verbose_level", type=int, default=0,
+                        help="Verbosity level")
+    parser.add_argument("--pudb", action="store_true",
+                        help="Launch with python debugger")
+    parser.add_argument("--debugpy", type=int,
+                        help="Launch with remote capable python debugger")
+    return parser.parse_args()
+
+def main(args): # pylint: disable=missing-function-docstring
+
+    if args.pudb:
+        try:
+            import pudb # pylint: disable=import-error,import-outside-toplevel
+            pudb.set_trace()
+        except ImportError as ex:
+            raise RuntimeError("You need to install pudb with the command 'pip3 install pudb --user'") from ex
+    elif args.debugpy:
+        try:
+            import debugpy # pylint: disable=import-error,import-outside-toplevel
+            debugpy.listen(args.debugpy) # Specify port to listen (by default on localhost)
+            LOGGER.info("Waiting for debugger attach on port %d", args.debugpy)
+            debugpy.wait_for_client() # Wait for the StudioCode debugger to attach
+            debugpy.breakpoint() # Configure a first breakpoint once Attach
+        except ImportError as ex:
+            raise RuntimeError("You need to install debugpy with the command 'pip3 install debugpy --user'") from ex
+
+    verbose_level = args.verbose_level
+    if not verbose_level:
+        LOGGER.info("argument verbosity_level is 0: to get the generated litmus tests dumped into a folder, please set it to at least 1.")
+
+    start = time()
+
+    if args.seed:
+        seed = args.seed
+    else:
+        seed = 2021
+
+    rand_gen = PopeyeRandom()
+    rand_gen.seed(seed)
+
+    is_genasm = False
+
+    layout_generator, agent_l = generate_scenario_environment(nb_of_agents_needed=2, nb_litmus_object=2)
+
+    litmus_generator = LitmusGenerator(rand_gen=rand_gen,
+                                       config_d=DummyConfig(rand_gen),
+                                       layout_generator=layout_generator,
+                                       arm2geninstr=Arm2GenInstrAsm() if is_genasm else Arm2GenInstr(),
+                                       verbose_level=args.verbose_level)
+
+    for agent in agent_l:
+        litmus_generator.register_cpu_gen_info(agent.agent_name, agent)
+
+    LOGGER.info("==> Testing scenario n°1")
+    observation_dictionary = test_scenario1(litmus_generator)
+    if verbose_level:
+        print(observation_dictionary)
+
+    litmus_generator = LitmusGenerator(rand_gen=rand_gen,
+                                       config_d=DummyConfig(rand_gen),
+                                       layout_generator=layout_generator,
+                                       arm2geninstr=Arm2GenInstrAsm() if is_genasm else Arm2GenInstr(),
+                                       verbose_level=args.verbose_level)
+
+    for agent in agent_l:
+        litmus_generator.register_cpu_gen_info(agent.agent_name, agent)
+
+    iterations = 5
+
+    LOGGER.info("==> Testing scenario n°2")
+    observation_dictionary = test_scenario2(litmus_generator, iterations, rand_gen)
+    if verbose_level:
+        print(dumps(observation_dictionary, sort_keys=False, indent=4))
+
+        print(f"pending sequences => total {len(litmus_generator.pending_sequences)}")
+        for i, pending in enumerate(litmus_generator.pending_sequences):
+            print(f"pending sequence n°{i} => {pending.litmus_d['name']} Done agents {pending.agents_done}")
+        print(f"completed sequences => total {len(litmus_generator.completed_sequences)}")
+        for i, completed in enumerate(litmus_generator.completed_sequences):
+            print(f"completed sequence n°{i} => {completed.litmus_d['name']} Done agents {completed.agents_done}")
+
+    end = time()
+    LOGGER.info("Time elapsed: %f seconds", end - start)
+
+if __name__ == "__main__":
+    parserargs = get_args()
+    main(parserargs)

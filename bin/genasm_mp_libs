@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+
+"""
+Command line utility to compile GenASM C sources.
+"""
+
+import os
+from subprocess import SubprocessError
+import sys
+import argparse
+import pathlib
+
+from lib_gmp.gmp_consts import PROJECTS
+from lib_gmp.test_directory import resetenv
+from lib_gmp.libs_compile import compile_libs
+from lib_gmp.results import results
+from lib_shared.const_log import getStdoutLogger
+
+
+def parse_args():
+    """Parse and return the arguments given to the script"""
+    parser = argparse.ArgumentParser(description="Compile genasm_mp source files")
+    parser.add_argument(
+            "--project",
+            type=str,
+            choices=PROJECTS,
+            default=None,
+            help="targeted project"
+    )
+    parser.add_argument(
+            "--dir",
+            type=str,
+            default="genasm_mp",
+            help="target directory for compiled files",
+    )
+    args_group = parser.add_mutually_exclusive_group()
+    args_group.add_argument(
+            "--keep_libs",
+            action="store_true",
+            help="don't clean C objects before compilation"
+    )
+    args_group.add_argument(
+            "--clean_only",
+            action="store_true",
+            help="only clean compiled C objects, don't compile them"
+    )
+
+    return parser.parse_args()
+
+
+def check_args(popeye_path: pathlib.Path, args: argparse.Namespace):
+    """Check the consistency of arguments given"""
+    genasm_mp_path = popeye_path / args.dir
+    if not genasm_mp_path.exists():
+        resetenv(genasm_mp_path)
+    results["genasm_mp_path"] = genasm_mp_path
+
+
+def run():
+    """Compile libs requested as requested by the script arguments."""
+    try:
+        popeye_path = pathlib.Path(os.environ["POPEYE_HOME"])
+        if not popeye_path.exists():
+            LOGGER.error("POPEYE_HOME (%s) does not exist, exiting", popeye_path)
+            return 1
+    except KeyError:
+        LOGGER.error("POPEYE_HOME not set, exiting")
+        return 1
+
+    args = parse_args()
+    check_args(popeye_path, args)
+    try:
+        compile_libs(
+                popeye_path,
+                args.dir,
+                platform_checker=True,
+                project=args.project,
+                keep_libs=args.keep_libs,
+                clean_only=args.clean_only)
+    except SubprocessError:
+        LOGGER.error("Compilation failed, exiting")
+        return 1
+    return 0
+
+
+LOGGER = getStdoutLogger()
+
+if __name__ == "__main__":
+    sys.exit(run())

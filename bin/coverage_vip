@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""
+Parse parameters used by Popeye to check that we use all those defined by the
+VIP.
+"""
+
+import os
+import sys
+
+from class_var_parser import get_class_properties
+from popeye_hn_params import get_parameters as get_hn_parameters
+from popeye_rn_params import get_parameters as get_rn_parameters
+
+POPEYE_HOME = os.environ["POPEYE_HOME"]
+
+
+def parse_vip_src_file():
+    """
+    Function in charge of returning the list of all VIP agent parameters defined in the given input file.
+    Here, we should be as most code-format agnostic as possible (We don't control this source file).
+    """
+    prefix = os.path.join(POPEYE_HOME, "lib", "vip")
+    hn_params = get_class_properties(
+            os.path.join(
+                    prefix,
+                    "chi5",
+                    "sv",
+                    "vip_chi5_uvc_pkg",
+                    "hn_agent",
+                    "vip_chi5_hn_agent_configuration.svh",
+            ),
+            (os.path.join(prefix, "chi5", "sv"), os.path.join(prefix, "shared_lib", "sv")),
+    )
+    rn_params = get_class_properties(
+            os.path.join(
+                    prefix,
+                    "chi5",
+                    "sv",
+                    "vip_chi5_uvc_pkg",
+                    "rn_agent",
+                    "vip_chi5_rn_agent_configuration.svh",
+            ),
+            (os.path.join(prefix, "chi5", "sv"), os.path.join(prefix, "shared_lib", "sv")),
+    )
+    return {
+            "hn": {hn_param["name"] for hn_param in hn_params if hn_param["rand"]},
+            "rn": {rn_param["name"] for rn_param in rn_params if rn_param["rand"]},
+    }
+
+
+def main():
+    """
+    Parse parameters used by Popeye to check that we use all those defined by
+    the VIP.
+    """
+
+    # TODO(nicbon01, LAC, define & use input arguments once the official VIP script will be known - see VIP-10344)
+
+    vip = parse_vip_src_file()
+    fake_ctx = {"MDS_PROJECT": "makalu",
+                "MDS_PROJECT_IS_SCPU": True,
+                "MDS_SN_BFM_NODEID": 32,
+                "MDS_RN_BFM_NODEID": 42,
+                "MDS_RTL_RN_NODEID_OFFSET": 64,
+                "MDS_SCU_CACHE_PROTECTION": True}
+    popeye_hn = set(get_hn_parameters(fake_ctx, "parser_handle"))
+    popeye_rn = set(get_rn_parameters(fake_ctx, "parser_handle")["main_cfg_handle"])
+
+    if popeye_hn >= vip["hn"] and popeye_rn >= vip["rn"]:
+        return 0
+
+    only_in_vip_hn = vip["hn"] - popeye_hn
+    if only_in_vip_hn:
+        print("Parameters defined by VIP HN but not used by Popeye:")
+        for param in sorted(only_in_vip_hn):
+            print("\t-", param)
+
+    only_in_vip_rn = vip["rn"] - popeye_rn
+    if only_in_vip_rn:
+        print("Parameters defined by VIP RN but not used by Popeye:")
+        for param in sorted(only_in_vip_rn):
+            print("\t-", param)
+
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

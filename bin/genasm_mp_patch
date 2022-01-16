@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+
+"helper tool to generate the checksum for a final test"
+
+import sys
+from lib_gmp.patch_elf import get_patch_args, patch_elf_file
+
+def main(args):
+    "main function to patch GenASM-MP tests"
+
+    if args.elf is not None:
+        patch_elf_file(args.elf, args, args.checksum_skip, args.checksum_incl, args.checksum_symbol, args.global_infoblock_symbol, args.verbose)
+    elif args.elf_files:
+        for line in args.elf_files:
+            line = line.strip()
+            if line.startswith("#"):
+                continue
+            with open(line, 'r+') as elf:
+                patch_elf_file(elf, args, args.checksum_skip, args.checksum_incl, args.checksum_symbol, args.global_infoblock_symbol, args.verbose)
+    else:
+        print("No ELF file provided to genasm_mp_patch")
+
+    return False
+
+if __name__ == "__main__":
+    sys.exit(main(get_patch_args(sys.argv[1:])))

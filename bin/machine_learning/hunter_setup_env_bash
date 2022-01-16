@@ -1,0 +1,6 @@
+#!/bin/bash
+
+export ML_PROJECT_NAME=hunter
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+source "${SCRIPT_DIR}/setup_env_bash"

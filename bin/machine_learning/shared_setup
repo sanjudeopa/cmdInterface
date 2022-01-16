@@ -1,0 +1,5 @@
+# Load the modules in a single file shared by tcsh/bash users
+
+module load arm/cluster
+module load swdev util
+module load ceme/dory_py3.9/0.6.8

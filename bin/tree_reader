@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+# -*- python -*-
+# vi:ft=python:
+"Provide interactive EVS explorer."
+
+import sys
+import os
+import argparse
+from lib_debug.tree_reader_factory import TreeReaderFactory
+
+def parse_args():
+    """Parse arguments"""
+
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-i",
+                       dest="evs",
+                       default=None,
+                       help="Path to evs. Open evs without retry")
+    group.add_argument("-I",
+                       dest="retry_evs",
+                       default=None,
+                       help="Path to evs. Open evs with retry. EVS may be read whilst being written")
+    group.add_argument("-sqlite",
+                       dest="sqlite",
+                       default=None,
+                       help="Path to the sqlite_db")
+    parser.add_argument("--project",
+                        default=os.environ.get("PROJ_NAME"),
+                        help="Project from which to load configuration.")
+    parser.add_argument("--sanity",
+                        action="store_true",
+                        help="don't open interactive, just load tree and exit")
+    parser.add_argument("--human-log",
+                        default=None,
+                        required=False,
+                        type=str,
+                        help="save a human readable file for the trace instead of opening the terminal")
+    parser.add_argument("--folded-table",
+                        action="store_true",
+                        help="save the human readable log as a folded table")
+    parser.add_argument("--debug",
+                        action="store_true",
+                        help="Raise Warnings instead of Exceptions")
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable profiling")
+    parser.add_argument("--display",
+                        metavar='ATTRIBUTE_TO_DISPLAY',
+                        default=None,
+                        nargs='+',
+                        required=False,
+                        help='attributes to display when printing human readable file')
+    parser.add_argument("--header-display",
+                        metavar='HEADER_TO_DISPLAY',
+                        default=None,
+                        nargs='+',
+                        required=False,
+                        help='attributes to display when printing the header in the folded table log')
+    parser.add_argument("--events",
+                        metavar='EVENTS_TO_DISPLAY',
+                        default=None,
+                        nargs='+',
+                        required=False,
+                        help='events to display when printing human readable file')
+    parser.add_argument("--log",
+                        default=None,
+                        required=False,
+                        type=str,
+                        help="dump activity in the named log file")
+    parser.add_argument("--debugpy", type=int,
+                        help="Launch with remote capable python debugger")
+
+    return parser.parse_args()
+
+def main(args): # pylint: disable=inconsistent-return-statements
+    "Launch interactive EVS explorer."
+
+    if args.debugpy:
+        import debugpy # pylint: disable=import-error,import-outside-toplevel
+        debugpy.listen(args.debugpy) # Specify port to listen (by default on localhost)
+        print(f"Waiting for debugger attach on port {args.debugpy}")
+        debugpy.wait_for_client() # Wait for the StudioCode debugger to attach
+        debugpy.breakpoint() # Configure a first breakpoint once Attach
+
+    factory = TreeReaderFactory(args)
+
+    if not factory.has_extensions():
+        print("Warning: no MAIN_PROJECT specified, using default configuration.")
+
+    tree = factory.get_tree_reader()
+
+    if args.human_log is not None:
+        with open(args.human_log, 'w') as fh:
+            if args.events:
+                events = tree.find(tname=args.events, display=args.display, sorted_ts=None)
+            else:
+                events = tree.find(display=args.display, sorted_ts=None)
+            if args.folded_table:
+                fh.write(events.as_folded_table(header_display=args.header_display, display=args.display))
+            else:
+                fh.write(events.as_table(display=args.display))
+        return False
+
+
+    if not args.sanity and not args.profile:
+
+        user_ns = factory.get_user_ns_objects()
+
+        def gen_lines():
+            'yield string lines for help message'
+            yield 'Give me some spinach, or ask me something!'
+            yield 'Try these:'
+            for key in user_ns:
+                yield 'In [1]: help({})'.format(key)
+
+        print("\n".join(gen_lines()))
+
+        from IPython import start_ipython # pylint: disable=import-outside-toplevel
+        start_ipython(argv=[], user_ns=user_ns)
+
+if __name__ == '__main__':
+    args_ = parse_args()
+    if args_.profile:
+        profile_filename = "tree_reader_profile.out"
+        import cProfile
+        cProfile.run("sys.exit(main(args_))", profile_filename)
+        import pstats
+        p = pstats.Stats(profile_filename)
+        p.sort_stats('tottime').print_stats()
+    else:
+        sys.exit(main(args_))

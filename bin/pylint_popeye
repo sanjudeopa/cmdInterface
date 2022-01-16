@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+'''
+Wrapper around pylint to supply the list of linted files and the configuration
+file easily to the program.
+'''
+
+import os
+from importlib.util import find_spec
+import sys
+from subprocess import check_output, CalledProcessError
+from argparse import ArgumentParser
+from glob import glob
+
+from pylint.lint import PyLinter, Run
+
+
+class OnlyLintArgsLinter(PyLinter):
+    """
+    custom linter to only lint files that were explicitely passed to pylint
+    """
+    @staticmethod
+    def should_analyze_file(modname, path, is_argument=False):  # pylint: disable=unused-argument
+        """
+        is_argument: is the file an argument to pylint ?
+        """
+        return is_argument
+
+
+class CustomRun(Run):
+    """
+    Custom runner that uses the OnlyLintArgsLinter
+    """
+    LinterClass = OnlyLintArgsLinter
+
+
+def root():
+    '''
+    Return the absolute path of a git repository root.
+
+    Raise CalledProcessError if the working directory is not a git repository.
+    '''
+    cmd = ['git', 'rev-parse', '--show-toplevel']
+    return check_output(cmd).strip()
+
+
+def lint(files,
+         rcfile,
+         jobs,
+         disable,
+         additional_builtins):
+    '''
+    Run pylint on all items in a file.
+
+    files -- list of strings
+        List of files to check with Pylint.
+        Files must be referenced from the root of the git repository.
+
+    rcfile -- string, optional
+        Filename of the configuration file.
+
+    jobs -- integer, optional
+        Number of processes on which to run pylint.
+
+    disable -- list, optional
+        a list of pylint checks that are disabled in this lint run.
+
+    additional_builtins -- list, optional
+        a list of additional builtins that can be assumed to be available.
+
+    Raise CalledProcessError if the working directory is not a git repository.
+    Raise OSError if the program `pylint' was not loaded.
+    '''
+
+    os.chdir(root())
+
+    cmd = ["pylint", f"--jobs={jobs}"]
+
+    if disable:
+        cmd.append("--disable={}".format(",".join(disable)))
+
+    if additional_builtins:
+        cmd.append("--additional-builtins={}".format(",".join(additional_builtins)))
+
+    if rcfile is not None:
+        cmd.append('--rcfile={0}'.format(os.path.abspath(rcfile)))
+
+    cmd.extend(files)
+
+    try:
+        return CustomRun(cmd[1:], do_exit=False).linter.msg_status
+    except KeyboardInterrupt:
+        return 1
+    except SystemExit as ex:
+        return ex.code
+
+def main(argv): # pylint: disable=too-many-statements
+    '''
+    Parse command-line arguments.
+
+    argv -- list of strings
+        Command line arguments to parse.
+    '''
+    popeye_home = os.environ["POPEYE_HOME"]
+
+    parser = ArgumentParser(
+            prog='pylint_popeye',
+            description='Check python modules with Pylint.')
+    parser.add_argument(
+            'files',
+            nargs='*',
+            default=[],
+            metavar='FILE',
+            help=('List of files to check.'
+                  " Paths must start from the repository's root."))
+    parser.add_argument(
+            "--configs", "-c",
+            action="store_true",
+            help="lint config files")
+    parser.add_argument(
+            "--print-files", "-p",
+            action="store_true",
+            help="Print all the files that will be linted")
+    parser.add_argument(
+            '--arg-file', '-a',
+            nargs='*',
+            default=[os.path.join(popeye_home, 'tools/infra/lint/common.txt'),],
+            metavar='FILE',
+            help=('Read the list of files to check from FILE.'
+                  " Paths must start from the repository's root."
+                  ' Files must be separated by newlines.'
+                  ' Empty lines and lines starting with # are discarded.'
+                  ' (Default: %(default)s)'))
+    parser.add_argument(
+            '--project',
+            required=False,
+            nargs='*',
+            default=[],
+            choices=('popeye', 'scpu', 'klein', 'hayes', 'nevis', 'genasm_mp'),
+            help='Choose set of files corresponding to the project')
+    parser.add_argument(
+            '--rc-file', '-r',
+            default=os.path.join(popeye_home, 'tools/infra/lint/pylint.rc'),
+            metavar='FILE',
+            help=('Custom pylint configuration file.'
+                  ' (Default: %(default)s)'))
+    parser.add_argument(
+            "--relaxed", "-x",
+            action="store_true",
+            help="apply a less strict set of rules")
+    parser.add_argument(
+            '--jobs', '-j',
+            default=4,
+            help=('Number of processes to use. When calling the script from'
+                  ' a non-interactive job please use only one process.'
+                  ' (Default: use all available processes)'))
+
+    args = parser.parse_args(argv[1:])
+
+    files = args.files
+    if not files:
+        if args.configs:
+            files += glob(os.path.join(popeye_home, "configs/*.tst"))
+            files += glob(os.path.join(popeye_home, "configs/*.cfg"))
+            files += glob(os.path.join(popeye_home, "configs/*/*.cfg"))
+        else:
+            project_files = ['common']
+
+            if 'genasm_mp' not in args.project:
+                project_files += ['popeye']
+            project_files += args.project
+
+            args.arg_file += [os.path.join(popeye_home, 'tools/infra/lint/{}.txt'.format(filename))
+                              for filename in project_files]
+
+            for filename in args.arg_file:
+                prefix = None
+                with open(filename) as fh:
+                    for lineno, line in enumerate(fh):
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        if prefix is None:
+                            prefix_tag, prefix = line.split(maxsplit=2)
+                            assert prefix_tag == "PREFIX"
+                            continue
+                        files_to_add = glob(os.path.join(os.path.expandvars(prefix), line))
+                        assert files_to_add, f"No files matching '{line}' (see {filename}:{lineno})"
+                        files += files_to_add
+
+    files = sorted(set(files))
+
+    # Raise ImportError if blk_utils is needed but not found.
+    if any("blkval" in path or 'popeye_univent' in path for path in files):
+        find_spec("blk_utils")
+
+    if args.configs:
+        additional_builtins = ["cfg",
+                               "cat",
+                               "include",
+                               "choice",
+                               "sample",
+                               "randrange",
+                               "uniform",
+                               "expovariate",
+                               "gauss",
+                               "gauss_int",
+                               "bool_true_pct",
+                               "multimodal",
+                               "multimodal_int",
+                               "CategoryDistribution",
+                               "WeightedRand",
+                               "WeightedRandPlus",
+                               "WeightedRangePlus",
+                               "CategoryWeight",
+                               "rand_gen",
+                               "build_options",
+                               "include_special_disable_file",
+                               "set_category_distribution",
+                               "get_category_distribution",
+                               "get_special_object_parameter_names_l",
+                               "verbose_level",
+                               "assert_gen",
+                               "arch_const",
+                               "imp_def_const",
+                               "project",
+                               "testbench",
+                               "is_genasm"]
+    else:
+        additional_builtins = []
+
+    if args.relaxed:
+        disable = ["too-many-lines",
+                   "line-too-long",
+                   "missing-docstring",
+                   "invalid-name",
+                   "bad-whitespace",
+                   "bad-continuation",
+                   "duplicate-code",
+                   "fixme"]
+    else:
+        disable = []
+
+    if args.print_files:
+        print("linting files:")
+        for file_name in files:
+            print("- {}".format(file_name))
+
+    try:
+        retcode = lint(files=files,
+                       rcfile=args.rc_file,
+                       jobs=args.jobs,
+                       disable=disable,
+                       additional_builtins=additional_builtins)
+    except CalledProcessError:
+        print("{0}: {1} is not a git repository.".format(parser.prog, os.getcwd()),
+              file=sys.stderr)
+        retcode = 1
+    except OSError:
+        print("{0}: Program `pylint' seems unavailable. Please load a correct module.".format(parser.prog),
+              file=sys.stderr)
+        retcode = 1
+    except ImportError:
+        print("{0}: Unable to find blk_val_libs. Was `dotshrc' sourced?".format(parser.prog),
+              file=sys.stderr)
+        raise
+
+    return retcode
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

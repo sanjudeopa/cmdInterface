@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+
+"Script to rerun the generator, exec_model or data_checker for a given test"
+
+import argparse
+import re
+import os
+import subprocess
+import sys
+
+def main(argv):
+    "Rerun command specified by the user"
+    parser = argparse.ArgumentParser(prog='popeye_rerun',
+                                     description='Rerun some commands used during a test')
+
+    parser.add_argument("--cmd", dest="cmd", type=str, required=True,
+                        choices=["generator", "exec_model", "data_checker"],
+                        help="Verbosity level")
+    parser.add_argument("--pudb", action="store_true",
+                        help="Debug the command with pudb")
+    parser.add_argument("--debugpy", type=int,
+                        help="Debug the command with debugpy")
+    parser.add_argument("-v", type=int,
+                        help="add -v option")
+
+    args = parser.parse_args(argv)
+
+
+    filename = 'blk_val.log'
+    # This regular expression has to be updated if blk_val_libs output changes
+    previous_word = '&&' if args.cmd == "data_checker" else 'module'
+    cmd_reg_exp = re.compile(r'Executing \[(.*{} {}.*)\]'.format(previous_word, args.cmd))
+
+    if not os.path.isfile(filename):
+        raise RuntimeError("This command should be run from within a simulation directory where there is a blk_val.log file")
+
+    cmd_to_rerun = None
+    with open(filename) as fh:
+        for line in fh:
+            match = cmd_reg_exp.search(line)
+            if match:
+                cmd_to_rerun = match.group(1)
+                break
+
+    if not cmd_to_rerun:
+        raise RuntimeError("The command '{}' to rerun was not found in {}".format(args.cmd, filename))
+
+    if args.pudb or args.debugpy:
+        popeye_home = os.environ.get("POPEYE_HOME")
+        if not popeye_home:
+            raise RuntimeError("'POPEYE_HOME' environment variable is not set")
+        print("\nWARNING: Did you load the module {}/modules/debug.module ?\n".format(popeye_home))
+        if args.pudb:
+            cmd_to_rerun += " --pudb"
+        else:
+            cmd_to_rerun += f" --debugpy {args.debugpy}"
+
+    if args.v:
+        cmd_to_rerun += f" -v {args.v}"
+
+    print("Rerun command: {}".format(cmd_to_rerun))
+    return subprocess.call(cmd_to_rerun, shell=True)
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

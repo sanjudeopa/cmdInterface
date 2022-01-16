@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+'''
+Run checkers on the execution traces captured during execution.
+'''
+import argparse
+import os
+import sys
+import time
+from logging import basicConfig
+
+from lib_checkers import data_checker_class
+from lib_shared.popeye_common import si_unit
+from lib_shared.const_log import getStdoutLogger
+
+LOGGER = getStdoutLogger()
+
+def parse_args():
+    'Define and parse the arguments of the data_checker'
+    parser = argparse.ArgumentParser("Run checkers on the execution traces captured during execution.")
+
+    parser.add_argument("--project", type=str, required=True,
+                        help="Name of the DUT project")
+    parser.add_argument("--mem_log_nb", type=int, action="store", default=100, metavar="N",
+                        help="Log and report N last writes done into the memory model in case of programmmers model error.")
+    parser.add_argument("--no_valev", action="store_true",
+                        help="Disable validation of events before using them.")
+    parser.add_argument("--no_human", action="store_true",
+                        help="Do not use colors in the output")
+    parser.add_argument("-v", dest="verbose_level", type=int, default=0,
+                        help="Verbosity level")
+    parser.add_argument("-i", dest="evs", default=None)
+    parser.add_argument("-I", dest="retry_evs", default=None)
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable profiling of the data_checker")
+    parser.add_argument("--pudb", action="store_true",
+                        help="Launch with awesome python debugger")
+    parser.add_argument("--debugpy", type=int,
+                        help="Launch with remote capable python debugger")
+    parser.add_argument("--timeout", type=int, default=15,
+                        help="timeout in minutes")
+
+    return parser.parse_args()
+
+
+def main(args):
+    '''
+    Run checkers on the execution traces captured during execution.
+    '''
+    if args.verbose_level > 0:
+        basicConfig(level=max(10 - args.verbose_level, 0))
+
+    if args.pudb:
+        import pudb # pylint: disable=import-error,import-outside-toplevel
+        pudb.set_trace()
+    elif args.debugpy:
+        import debugpy # pylint: disable=import-error,import-outside-toplevel
+        debugpy.listen(args.debugpy) # Specify port to listen (by default on localhost)
+        LOGGER.info("Waiting for debugger attach on port %d", args.debugpy)
+        debugpy.wait_for_client() # Wait for the StudioCode debugger to attach
+        debugpy.breakpoint() # Configure a first breakpoint once Attach
+
+    assert (args.evs is None) != (args.retry_evs is None)
+    threaded = args.retry_evs is not None
+    evs = args.evs if args.retry_evs is None else args.retry_evs
+    max_size = 150 * 1024 * 1024 # bytes
+    if not threaded and os.path.getsize(evs) > max_size:
+        LOGGER.error("%s file size exceeded: more than %s", evs, si_unit(max_size, "B"))
+        return 1
+
+    start_time = time.time()
+
+    data_checker_inst = data_checker_class.DataChecker(args.project,
+                                                       evs,
+                                                       threaded,
+                                                       args.no_valev,
+                                                       args.mem_log_nb,
+                                                       not args.no_human,
+                                                       args.verbose_level)
+    try:
+        data_checker_inst.run()
+    except Exception as e: # pycov: chk-fail # pylint: disable=broad-except
+        # Broad catch to help blk val see the full stacktrace.
+        LOGGER.error("%s: %s", e.__class__.__name__, e)
+        raise
+
+    checking_time = time.time() - start_time
+    LOGGER.info("Checks done in %.2f seconds", checking_time)
+
+    timeout_in_minutes = args.timeout
+    if checking_time > 60 * timeout_in_minutes and not threaded:
+        LOGGER.error("Data_checker execution took more than %d minutes, which is a performance issue", timeout_in_minutes)
+
+    return 0
+
+if __name__ == '__main__':
+    ARGS = parse_args()
+
+    if ARGS.profile:
+        profile_filename = "data_checker_profile.out"
+        import cProfile
+        cProfile.run("sys.exit(main(ARGS))", profile_filename)
+        import pstats
+        p = pstats.Stats(profile_filename)
+        p.sort_stats('tottime').print_stats()
+    else:
+        sys.exit(main(ARGS))

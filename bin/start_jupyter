@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+jupyter-notebook \
+    --no-browser \
+    --ip="$(hostname --fqdn)" \
+    --notebook-dir="${POPEYE_HOME}/tools/lib_shared/statistics/notebooks"

@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# vi:ft=sh:ts=4:sw=4:et:
+
+set -euo pipefail
+printf '%s %s\n' "$0" "$*"
+
+if [[ -n "${LSB_JOBID:-}" ]]; then
+    printf 'LSB_JOBID: %s\n' "${LSB_JOBID:?}"
+fi
+
+err () {
+    >&2 printf '%s: error %s\n' "$0" "$*"
+    exit 1
+}
+
+get_build_options () {
+    set -euo pipefail
+    local project
+    declare -a build_options=()
+    project="${1:?}"
+    shift 1
+
+    build_options+=(--dfs 'batch:ui=console:keep=always')
+
+    case "${plan}" in
+        mth|hunter)
+            build_options+=(--mti --bo 'core=1:dsize=32:l2size=256:pbha=n:async_bridge:l3size=1024:memory=verilog' --dfs 'console:cov:fcov:simbits=64') ;;
+        klein|hayes)
+            build_options+=(--mti --bo 'core=1:clust=1:i_bfm=fetch:memory=l2_agent:l2tlb_agent=False' '--dfs=coverage') ;;
+        *) err "project ${project} not supported" ;;
+    esac
+
+    printf '%s\n' "${build_options[@]}"
+}
+
+compile () {
+    set -euo pipefail
+
+    printf 'Running blk_compile with arguments: %s\n\n' "$*"
+    blk_compile --build-clean --no-color "$@"
+}
+
+val () {
+    set -euo pipefail
+    local seed dir
+    declare -a options configs
+    printf 'Running blk_val with arguments: %s\n\n' "$*"
+
+    project="${1:?}"
+    shift 1
+
+    options+=(--no-color --body-time 5)
+    while (( $# > 0 )); do
+        options+=("$1")
+        shift
+    done
+
+
+    configs=(test_all few_transactions fast_gen fast disable)
+
+    seed=1
+    dir="blk_val__plan_${project}_build_option_id_1__config_id_1__s${seed}"
+
+    set -x
+    blk_val -s "${seed}" "${configs[@]}" "${options[@]}" --dir "${dir}"
+    blk_status "${dir}"
+    rm -rf "${dir}"
+    set +x
+}
+
+run () {
+    set -euo pipefail
+    local project build_file regression_list
+    declare -a blk_run_options
+
+    printf 'Running blk_run with arguments: %s\n\n' "$*"
+
+    while (( "$#" > 0 )); do
+        case "$1" in
+            mth)
+                project="$1"
+                build_file=reference.txt
+                regression_list=regression/popeye/default_makalu.list
+                ;;
+            hunter)
+                project="$1"
+                build_file=reference.txt
+                regression_list=scpu.list
+                ;;
+            klein)
+                project="$1"
+                build_file=klein/simulation/popeye/build_configs/ananke_reference.UM2.bringup.txt
+                regression_list=klein/simulation/popeye/regression/ananke.UM2.bringup.list
+                ;;
+            hayes)
+                project="$1"
+                build_file=hayes/simulation/popeye/build_configs/klein.r1.all.txt
+                regression_list=regression/popeye/default_klein.list
+                ;;
+            *) err "project ${1} not supported" ;;
+        esac
+        shift
+    done
+    blk_run_options=(--collect-stats --dfs coverage)
+    blk_run_options+=(--max-launch 5)
+
+    clean --logs
+    printf '\n'
+    set -x
+
+    blk_run --build \
+            --main-seed 0 \
+            --bof "${build_file:?}" \
+            "${regression_list:?}" \
+            "${blk_run_options[@]}"
+
+    printf 'Running blk_report: \n\n'
+    report
+}
+
+# Delete older compiled libraries, python cache files and logs.
+clean () {
+    printf 'Running blk_clean with arguments: %s\n\n' "$*"
+    blk_clean --python tools -r --lib-all "$@" >/dev/null
+    #rm -irf stats_collection blk_val__plan_klein_build_option* merge_coverage compile_infos
+}
+
+# Delete older compiled libraries, python cache files and logs.
+report () {
+    printf 'Running blk_report with arguments: %s\n\n' "$*"
+    blk_report "$@"
+}
+
+merge () {
+    printf 'Running blk_merge: \n\n'
+    blk_merge all_merge_coverage "$(find merge_coverage/ -name "*klein_simulation_popeye_build_configs_ananke_reference*" -prune)"
+}
+
+lint () {
+    printf 'Running blk_lint: \n\n'
+    blk_lint --flow mti --run full --set-lsf-mem-limit 8000
+}
+
+cover_report () {
+    printf 'Running blk_cover_report: \n\n'
+    blk_cover_report merge_coverage/all_merge_coverage/ --view ASRT_CC_FC_DTL_HTML
+}
+
+usage () {
+    cat << EOF
+
+Usage: ./$(basename "$0") [-h|--help] [hayes|klein|mth|hunter] [compile|val|run|clean]
+
+options:
+      -h|--help      Show help
+      project_name   Provide name of project
+      blk_cmd        Type of blk val command to be run without blk_ options.
+                     e.g compile, val, run or clean
+(Hint Don't forget to setup popeye environment before using any blk_commands)
+EOF
+}
+
+main () {
+    set -euo pipefail
+    local project action
+    declare -a build_options other_options
+
+    . /arm/tools/setup/lib/sh
+    while (( $# > 0 )); do
+        case "$1" in
+            --h|--help)                 usage; exit 0;;
+            mth|hunter|klein|hayes)     plan="$1" ;;
+            clean|val|run|compile|lint) action="$1" ;;
+            merge|report|cover_report)  action="$1" ;;
+            *)                          other_options=("$1") ;;
+        esac
+        shift
+    done
+
+    case "${plan:?}" in
+        mth|hunter|klein|hayes) project="$plan" ;;
+        *) err "unknown option $plan" ;;
+    esac
+
+    readarray -t build_options <<<"$(get_build_options "${project}")"
+
+    case "${action:?}" in
+        compile)      compile     "${build_options[@]}" ;;
+        val)          val         "${project:?}" \
+                                  "${build_options[@]}" \
+                                  "${other_options[@]+"${other_options[@]}"}";;
+        run)          run         "${project:?}";;
+        merge)        merge       ;;
+        lint)         lint        ;;
+        report)       report      "${other_options[@]+"${other_options[@]}"}";;
+        cover_report) cover_report;;
+        clean)        clean       "${build_options[@]}" \
+                                  --logs;;
+        -h|--help)    usage       ;exit 0;;
+        *)            err         "unknown action ${action}" ;;
+    esac
+}
+
+main "$@"

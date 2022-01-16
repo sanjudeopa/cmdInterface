@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+
+"""
+Custom ELF linker for GenASM-MP.
+A big difference to other linkers is that this one is able (and was specifically written to) combine object files of different
+architectures and produce partial (but interdependent) output files.
+
+For now we can combine ARM and AArch64 code and produce one secure and one non-secure file.
+"""
+
+import argparse
+import json
+
+from lib_gmp.gmp_consts import iside_map
+from lib_generator.range_object import RangeObject
+from lib_generator.elf import ElfLinker
+
+super_global_symbols = {
+        "global_infoblock",
+        "validation_print_sem",
+        "print_cpu_num_flag",
+        "stopped",
+        "failure",
+        "threading_sequence_aarch32",
+        "loop_flag",
+}
+
+super_global_symbols_wildcard = {
+        "will_abort_*",
+        "maybe_abort_*",
+        "skip_abort_*",
+        "will_iside_abort_*",
+        "BLOCK_*",
+        "threading_start_*",
+        "threading_body_*",
+        "threading_placeholder_*",
+        "increment_var_*_count_*Th*",
+        "checksum_range_*",
+        "string_*",
+}
+
+debug_sections = (".debug_abbrev",
+                  ".debug_aranges",
+                  ".debug_frame",
+                  ".debug_info",
+                  ".debug_line",
+                  ".debug_loc",
+                  ".debug_macinfo",
+                  ".debug_pubnames",
+                  ".debug_pubtypes",
+                  ".debug_ranges",
+                  ".debug_str",
+                  ".debug_types")
+
+def add_debug_regions(space):
+    """
+    helper function to add all the DWARF debug sections to a given output space
+
+    @param space: the L{OutputSpace} to which to add the debug sections
+    """
+
+    for name in debug_sections:
+        space.add_region(name=name,
+                         pattern=[("*.o", name)])
+
+def extend_symbol_map(symbol_map,
+                      executable_alias_offset,
+                      iside_range):
+    """
+    in case of multiple executable mappings of test code, extend the symbols
+    to add symbols for aliases in the form <original_symbol_name>.alias
+    """
+    assert executable_alias_offset > 0, "no need to extend the symbol map if executable_alias_offset is zero"
+    alias_offset = executable_alias_offset
+
+    for va, symbol_name in symbol_map:
+        yield (va, symbol_name)
+        if va in iside_range:
+            yield (va + alias_offset, f'{symbol_name}.alias')
+
+def add_secure_regions(space_s, args, get_int_def):
+    """
+    Handle all the regions to be included in the secure ELF file
+    """
+    if args.debug_sections:
+        add_debug_regions(space_s)
+
+    space_s.add_auto_region(input_prefix=".s.data.init.",
+                            output_pattern=".data.init.{:#x}")
+
+    space_s.add_meta_region(pattern=".trs.*")
+    space_s.add_meta_region(pattern=".index.*")
+    space_s.add_meta_region(pattern=".config.*")
+    space_s.add_meta_region(pattern=".range.*")
+
+    space_s.add_auto_region(input_prefix=".s.code.",
+                            output_pattern=".code.{:#x}",
+                            executable=True)
+
+    if get_int_def("BASE_LIB") != 0:
+        space_s.add_region(name=".text.trampoline",
+                           phys_address=0x0,
+                           executable=True,
+                           pattern=[("*.o", ".text.trampoline")])
+
+    space_s.add_region(name=".text.lib",
+                       phys_address=get_int_def("BASE_LIB"),
+                       max_size=get_int_def("BASE_LIB_SIZE"),
+                       executable=True,
+                       pattern=[("*.o", ".text.boot"),
+                                ("*.o", ".text.vector"),
+                                ("*.o", ".text.boot_sysregs"),
+                                ("*.o", ".text"),
+                                ("*.o", ".text.*")])
+
+    space_s.add_region(name=".rodata",
+                       phys_address=get_int_def("BASE_CONST"),
+                       max_size=get_int_def("BASE_CONST_SIZE"),
+                       pattern=[("*.o", ".global_infoblock"),
+                                ("*.o", ".rodata"),
+                                ("*.o", ".rodata.*"),
+                                ("*.o", ".const"),
+                                ("*.o", ".genasm_mp")])
+
+def add_non_secure_regions(space_ns, get_int_def, coalesce):
+    """
+    Handle all the regions to be included in the non-secure ELF file
+    """
+    space_ns.add_auto_region(input_prefix=".ns.data.init.",
+                             output_pattern=".data.init.{:#x}")
+    space_ns.add_auto_region(input_prefix=".ns.code.",
+                             output_pattern=".code.{:#x}",
+                             executable=True)
+
+    space_ns.add_region(name=".ns.data.c",
+                        phys_address=get_int_def("BASE_CACHEABLE_NS"),
+                        max_size=get_int_def("BASE_CACHEABLE_NS_SIZE"),
+                        writable=True,
+                        pattern=[("*.o", ".ns.data"),
+                                 ("*.o", ".ns.bss")])
+
+    if not coalesce:
+        space_ns.add_region(name=".text.lib",
+                            phys_address=get_int_def("BASE_LIB"),
+                            max_size=get_int_def("BASE_LIB_SIZE"),
+                            executable=True,
+                            pattern=[("*.o", ".text.boot"),
+                                     ("*.o", ".text.vector"),
+                                     ("*.o", ".text.boot_sysregs"),
+                                     ("*.o", ".text"),
+                                     ("*.o", ".text.*")])
+
+        space_ns.add_region(name=".rodata",
+                            phys_address=get_int_def("BASE_CONST"),
+                            max_size=get_int_def("BASE_CONST_SIZE"),
+                            pattern=[("*.o", ".global_infoblock"),
+                                     ("*.o", ".rodata"),
+                                     ("*.o", ".rodata.*"),
+                                     ("*.o", ".const"),
+                                     ("*.o", ".genasm_mp")])
+
+def add_root_regions(space_root, get_int_def):
+    """
+    Handle all the regions to be included in the root ELF file
+    """
+    space_root.add_region(name=".text.lib",
+                          phys_address=get_int_def("BASE_LIB_ROOT"),
+                          max_size=get_int_def("BASE_LIB_SIZE"),
+                          executable=True,
+                          pattern=[("*.o", ".text.boot"),
+                                   ("*.o", ".text.vector"),
+                                   ("*.o", ".text.boot_sysregs"),
+                                   ("*.o", ".text"),
+                                   ("*.o", ".text.*")])
+
+    space_root.add_region(name=".text.test",
+                          phys_address=get_int_def("BASE_TEST_HEADER_ROOT"),
+                          max_size=get_int_def("BASE_TEST_HEADER_SIZE"),
+                          executable=True,
+                          pattern=[("*.o", ".test"),
+                                   ("*.o", ".test.*")])
+
+    space_root.add_region(name=".rodata",
+                          phys_address=get_int_def("BASE_CONST"),
+                          max_size=get_int_def("BASE_CONST_SIZE"),
+                          pattern=[("*.o", ".global_infoblock"),
+                                   ("*.o", ".const"),
+                                   ("*.o", ".genasm_mp")])
+
+    space_root.add_auto_region(input_prefix=".root.data.init.",
+                               output_pattern=".data.init.{:#x}")
+
+    space_root.add_auto_region(input_prefix=".root.code.",
+                               output_pattern=".code.{:#x}",
+                               executable=True)
+
+def add_realm_regions(space_realm, get_int_def):
+    """
+    Handle all the regions to be included in the realm ELF file
+    """
+    space_realm.add_region(name=".text.lib",
+                           phys_address=get_int_def("BASE_LIB_REALM"),
+                           max_size=get_int_def("BASE_LIB_SIZE"),
+                           executable=True,
+                           pattern=[("*.o", ".text.boot"),
+                                    ("*.o", ".text.vector"),
+                                    ("*.o", ".text.boot_sysregs"),
+                                    ("*.o", ".text"),
+                                    ("*.o", ".text.*")])
+
+    space_realm.add_region(name=".text.test",
+                           phys_address=get_int_def("BASE_TEST_HEADER_REALM"),
+                           max_size=get_int_def("BASE_TEST_HEADER_SIZE"),
+                           executable=True,
+                           pattern=[("*.o", ".test"),
+                                    ("*.o", ".test.*")])
+
+    space_realm.add_region(name=".rodata",
+                           phys_address=get_int_def("BASE_CONST"),
+                           max_size=get_int_def("BASE_CONST_SIZE"),
+                           pattern=[("*.o", ".global_infoblock"),
+                                    ("*.o", ".const"),
+                                    ("*.o", ".genasm_mp")])
+
+    space_realm.add_auto_region(input_prefix=".realm.data.init.",
+                                output_pattern=".data.init.{:#x}")
+
+    space_realm.add_auto_region(input_prefix=".realm.code.",
+                                output_pattern=".code.{:#x}",
+                                executable=True)
+
+def main(args):
+    """
+    main function that is starting the starting the linking process.
+
+    @param args: named tuple with command line arguments
+    """
+
+    if args.debugpy:
+        import debugpy # pylint: disable=import-error,import-outside-toplevel
+        debugpy.listen(args.debugpy) # Specify port to listen (by default on localhost)
+        print(f"Waiting for debugger attach on port {args.debugpy}")
+        debugpy.wait_for_client() # Wait for the StudioCode debugger to attach
+        debugpy.breakpoint() # Configure a first breakpoint once Attach
+
+    defines = json.load(args.defines)["defines"]
+    get_int_def = lambda k: int(defines[k], 0)
+
+    linker = ElfLinker(super_global_symbols=super_global_symbols,
+                       super_global_symbols_wildcard=super_global_symbols_wildcard,
+                       strip_symbols="*" if args.strip_symbols else None,
+                       relaxed=args.relaxed)
+
+    space_s = linker.add_space("secure", args.elf_s)
+    add_secure_regions(space_s, args, get_int_def)
+
+    if args.elf_ns:
+        space_ns = linker.add_space("non-secure", args.elf_ns)
+        if args.debug_sections:
+            add_debug_regions(space_ns)
+    elif args.coalesce:
+        space_ns = space_s
+    else:
+        raise RuntimeError("NS regions must be dumped in separate ELF or coalesced with secure regions")
+
+    add_non_secure_regions(space_ns, get_int_def, args.coalesce)
+
+    space = space_s if defines["TEST_MODE_SECURE"] else space_ns
+
+    if args.elf_root:
+        space_root = linker.add_space("root", args.elf_root)
+        add_root_regions(space_root, get_int_def)
+
+    if args.elf_realm:
+        space_realm = linker.add_space("realm", args.elf_realm)
+        add_realm_regions(space_realm, get_int_def)
+
+    space.add_region(name=".data.c",
+                     phys_address=get_int_def("BASE_CACHEABLE"),
+                     max_size=get_int_def("BASE_CACHEABLE_SIZE"),
+                     writable=True,
+                     pattern=[("*.o", ".data"),
+                              ("*.o", ".bss")])
+
+    space.add_region(name=".data.ngnrne",
+                     phys_address=get_int_def("BASE_DEVICE"),
+                     max_size=get_int_def("BASE_DEVICE_SIZE"),
+                     writable=True,
+                     pattern=[("*.o", ".data.ngnrne")])
+
+    space.add_region(name=".stack",
+                     phys_address=get_int_def("BASE_STACK"),
+                     max_size=get_int_def("BASE_STACK_SIZE"),
+                     writable=True,
+                     pattern=[("*.o", ".stack")])
+
+    space.add_region(name=".threads_stack",
+                     phys_address=get_int_def("BASE_THREADS_STACK"),
+                     max_size=get_int_def("BASE_THREADS_STACK_SIZE"),
+                     writable=True,
+                     pattern=[("*.o", ".threads_stack")])
+
+    space.add_region(name=".text.test",
+                     phys_address=get_int_def("BASE_TEST_HEADER"),
+                     max_size=get_int_def("BASE_TEST_HEADER_SIZE"),
+                     executable=True,
+                     pattern=[("*.o", ".test"),
+                              ("*.o", ".test.*")])
+
+    linker.link_files(required_files=args.required_files,
+                      optional_files=args.optional_files,
+                      entry_point=int(defines["BASE_LIB_ROOT"] if args.elf_root else defines["BASE_LIB"], 16))
+
+    if args.map:
+        symbol_map = linker.get_symbol_map()
+        executable_alias_offset = get_int_def("ISIDE_AREA_EXECUTABLE_ALIAS_OFFSET")
+        if executable_alias_offset:
+            symbol_map = get_updated_symbol_map(get_int_def, symbol_map, executable_alias_offset)
+        linker.dump_map_file(args.map, symbol_map)
+
+    if args.verbose:
+        for line in linker.iterate_str():
+            print(line)
+
+def get_updated_symbol_map(get_int_def, symbol_map, executable_alias_offset):
+    """
+    get an updated symbol map taking care of aliased iside pages
+    """
+    iside_range = RangeObject(clean_range_l=[(get_int_def(f"BASE_{iside_area}"),
+                                              get_int_def(f"BASE_{iside_area}") + get_int_def(f"BASE_{iside_area}_SIZE"))
+                                             for iside_area in iside_map])
+
+    return extend_symbol_map(symbol_map,
+                             executable_alias_offset,
+                             iside_range)
+
+def get_args():
+    """
+    helper function to instantiate an L{ArgumentParser} suitable for the linker
+
+    @return: a L{namedtuple} instance containing the parsed command line options
+    """
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--defines", type=argparse.FileType("r"), required=True)
+
+    parser.add_argument("-v", "--verbose",
+                        action="store_true")
+    parser.add_argument("-g", "--debug-sections", help="copy debug sections to output file(s)",
+                        action="store_true")
+    parser.add_argument("-s", "--strip-symbols", help="do to not copy symbols to output file(s)",
+                        action="store_true")
+    parser.add_argument("--elf_s", required=True)
+    parser.add_argument("--elf_ns")
+    parser.add_argument("--elf_root")
+    parser.add_argument("--elf_realm")
+    parser.add_argument("--map", help="dump list of symbols from output ELFs")
+    parser.add_argument("--coalesce",
+                        action="store_true",
+                        help="dump non-secure regions in secure ELF")
+    parser.add_argument("--relaxed",
+                        action="store_true",
+                        help="disable some relocation assertions")
+    parser.add_argument("--required-files",
+                        nargs="+",
+                        type=argparse.FileType("rb"))
+    parser.add_argument("--optional-files",
+                        nargs="*",
+                        type=argparse.FileType("rb"))
+    parser.add_argument("--debugpy", type=int,
+                        help="Launch with remote capable python debugger")
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    main(get_args())

@@ -1,0 +1,5 @@
+#!/usr/bin/env tclsh
+
+source [file normalize [file dirname [info script]]/../modules]/libpopeye.tcl
+
+exit [expr {[popeye-dependency-check] ? 0 : 1}]

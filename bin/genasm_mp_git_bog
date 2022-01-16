@@ -1,0 +1,564 @@
+#!/usr/bin/env python3
+"Tool used aimed at matching bugs filed in Jira and revisions available in a git repository."
+
+# pylint: disable=bad-continuation  # because the code is formatted with `black`
+
+import argparse
+import re
+import sys
+import time
+from collections import defaultdict
+from typing import Collection, DefaultDict, Dict, List, Optional, Set
+from pathlib import Path
+from enum import Enum, auto
+
+import armjira
+from git import Repo, Commit
+from git.exc import GitCommandError, InvalidGitRepositoryError
+
+from lib_shared.const_log import getStdoutLogger
+
+
+LOGGER = getStdoutLogger(__file__)
+
+
+def short_sha1(revision: Optional[str]) -> str:
+    "Returns shortened sha1/revision for a given revision"
+    return revision[:9] if revision else ""
+
+
+class Bug:
+    """Proxy class for an ArmIssue. Mainly used for performance reasons: since
+    we're repeatedly matching a bug's sha1 fields, those need to be retrieved
+    and computed only once"""
+
+    def __init__(self, issue: armjira.issue.ArmIssue) -> None:
+        self.issue = issue
+        self.introduced = short_sha1(issue.revision_introduced)
+        self.found = short_sha1(issue.revision_found)
+        self.fixed = short_sha1(issue.revision_fixed)
+
+    def __repr__(self) -> str:
+        return repr(self.issue)
+
+    def __str__(self) -> str:
+        return str(self.issue)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, self.__class__) and self.issue == other.issue
+
+    def __hash__(self) -> int:
+        return hash(self.issue)
+
+
+class BugImpact(Enum):
+    "Simple enum to represent the impact a Jira bug has on a git revision"
+    NoImpact = auto()
+    Introduced = auto()
+    Found = auto()
+    Fixed = auto()
+    Confirmed = auto()
+    Potential = auto()
+    MissingFixedSha1 = auto()
+
+
+class Revision:
+    """Represent a revision in the git repository, in the context of a given
+    branch.
+    The context is important to guess whether a revision is impacted by a bug!
+
+    :param position: position of the commit in the list of revisions of the branch
+    :param revisions: dict of revisions representing the context of the revision
+    :param commit: underlying git Commit object for the revision
+    """
+
+    def __init__(
+        self,
+        position: int,
+        revisions: DefaultDict[str, Optional["Revision"]],
+        commit: Commit,
+    ) -> None:
+        self.position = position
+        self.revisions = revisions
+        self.commit = commit
+        self.confirmed_issues: List[Bug] = []
+        self.potential_issues: List[Bug] = []
+        self.missing_sha1_issues: List[Bug] = []
+        self.introduced: Optional[Bug] = None
+        self.found: Optional[Bug] = None
+        self.fixed: Optional[Bug] = None
+
+    @property
+    def sha1(self) -> str:
+        "Shortened (9-char) sha1 of the revision"
+        return short_sha1(self.commit.hexsha)
+
+    def check_bugs_impact(self, bugs: List[Bug]) -> None:
+        """Check if the revision is impacted by the given list of bugs.
+        This relies heavily on the context of the revision (list of revisions
+        of the branch).
+        As a result of this, the fields introduced / found / fixed /
+        confirmed_issues and potential_issues will be filled appropriately.
+
+        :param bugs: the list of bugs
+        """
+        for bug in bugs:
+            bug_impact = self._is_impacted_by(bug)
+            if bug_impact == BugImpact.Introduced:
+                self.introduced = bug
+            elif bug_impact == BugImpact.Found:
+                self.found = bug
+            elif bug_impact == BugImpact.Fixed:
+                self.fixed = bug
+            elif bug_impact == BugImpact.Confirmed:
+                self.confirmed_issues.append(bug)
+            elif bug_impact == BugImpact.Potential:
+                self.potential_issues.append(bug)
+            elif bug_impact == BugImpact.MissingFixedSha1:
+                self.missing_sha1_issues.append(bug)
+
+    def _is_impacted_by(self, bug: Bug) -> BugImpact:
+        """Checks if bug impacts the current revision, in its context.
+
+        :param bug: the bug whose impact we want to check
+        """
+        revision_found = self.revisions[bug.found]
+        revision_introduced = self.revisions[bug.introduced]
+        revision_fixed = self.revisions[bug.fixed]
+
+        impact = BugImpact.NoImpact
+
+        if self == revision_found:
+            impact = BugImpact.Found
+
+        elif self == revision_fixed:
+            impact = BugImpact.Fixed
+
+        elif self == revision_introduced:
+            impact = BugImpact.Introduced
+
+        elif (revision_introduced is not None and revision_introduced < self) or (
+            revision_found is not None and revision_found < self
+        ):
+            if not bug.fixed and (
+                bug.issue.status == "Resolved" or bug.issue.status == "Closed"
+            ):
+                # The Jira issue is closed, but the revision_fixed is missing...
+                impact = BugImpact.MissingFixedSha1
+            elif revision_fixed is None or self < revision_fixed:
+                impact = BugImpact.Confirmed
+            elif revision_fixed < self:
+                impact = BugImpact.NoImpact
+            else:
+                impact = BugImpact.Potential
+
+        elif (
+            revision_fixed is not None and revision_fixed < self
+        ) or self < revision_introduced:
+            impact = BugImpact.NoImpact
+
+        elif revision_fixed is not None:
+            impact = BugImpact.Potential
+
+        elif revision_found is not None and self < revision_found:
+            impact = BugImpact.Potential
+
+        return impact
+
+    def __repr__(self) -> str:
+        return self.sha1
+
+    def __str__(self) -> str:
+        return repr(self)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, self.__class__) and self.sha1 == other.sha1
+
+    def __lt__(self, other: object) -> bool:
+        return isinstance(other, self.__class__) and self.position > other.position
+
+
+class BugPrinter:
+    "Class aimed at handling the printing of bugs and revisions on a terminal."
+
+    def __init__(
+        self, impacting_bugs: Set[Bug], no_color=False, no_res_summary=False
+    ) -> None:
+        self.impacting_bugs = impacting_bugs
+        self.no_color = no_color
+        self.no_res_summary = no_res_summary
+        self._colors: Dict[Bug, str] = {}
+
+    def print_revision(self, revision: Revision) -> None:
+        """Print a single line representing a revision and the impacts that bugs
+        have on it.
+        The line starts with characters showing the impacts of the Printer bugs
+        on the given revision, colored if appropriate. Characters are chosen as
+        specified by BugPrinter.IMPACTS.
+        The line continues with the 9-characters sha1 of the revision, followed
+        by its summary in Git.
+
+        :param revision: the revision to print
+        """
+        bugs_impact = "".join(
+            [self._get_impact_char(bug, revision) for bug in self.impacting_bugs]
+        )
+        summary = revision.commit.summary
+        for bug in self.impacting_bugs:
+            match = re.match(rf"(.*){bug.issue.key}(.*)", summary)
+            if match:
+                summary = f"{match.group(1)}{self._color_text(bug.issue.key, bug)}{match.group(2)}"
+        line = f"{bugs_impact}\t{revision.sha1} {summary}"
+        print(line)
+
+    def print_bugs(self, bugs: Collection[Bug]) -> None:
+        """Print a collection of bugs with information available:
+        issue key, current status, current owner, revisions introduced /
+        identified / fixed, summary in Jira.
+        Also prints the resolution summary unless requested not to.
+        Issues keys will be colored unless the printer is requested not to.
+
+        :param bugs: collection of bugs to print
+        """
+        key_width = max([len(bug.issue.key) for bug in bugs] + [len("Issue")])
+        status_width = 11
+        revision_width = 10
+        owner_width = max(
+            [len(bug.issue.owner) if bug.issue.owner else 0 for bug in bugs]
+            + [len("Owner")]
+        )
+        summary_width = max([len(bug.issue.summary) for bug in bugs] + [len("Summary")])
+
+        def pad(value: str, length: int) -> str:
+            """Make sure the given string has the exact length requested.
+            This means right-padding with spaces if too short, and truncating
+            if too long."""
+            return f"{value:{length}.{length}}"
+
+        header_fields = [
+            pad("Issue", key_width),
+            pad("Status", status_width),
+            pad("Owner", owner_width),
+            pad("Introduced", revision_width),
+            pad("Identified", revision_width),
+            pad("Fixed", revision_width),
+            pad("Jira summary", summary_width),
+        ]
+        if not self.no_res_summary:
+            header_fields.append("Resolution summary")
+        header = " | ".join(header_fields)
+        print(header)
+        print("=" * len(header))
+        for bug in bugs:
+            fields = [
+                self._color_text(pad(bug.issue.key, key_width), bug),
+                pad(bug.issue.status, status_width),
+                pad(bug.issue.owner or "", owner_width),
+                pad(bug.introduced or "", revision_width),
+                pad(bug.found or "", revision_width),
+                pad(bug.fixed or "", revision_width),
+                pad(bug.issue.summary, summary_width),
+            ]
+            if not self.no_res_summary:
+                fields.append(bug.issue.resolution_summary or "")
+            print(" | ".join(fields))
+
+    @staticmethod
+    def print_legend() -> None:
+        """Print the characters used to represent the bugs impact, and their
+        description."""
+        print("Legend:")
+        for impact in BugImpact:
+            char, msg = BugPrinter.IMPACTS[impact]
+            print(f"\t{char} {msg}")
+
+    def _get_impact_char(self, bug: Bug, revision: Revision) -> str:
+        """Returns the appropriate character showing the impact of a bug on a
+        given revision.
+
+        :param bug: the bug object, hopefully with appropriate sha1s filled.
+        :param revision: revision to be checked
+        :return: a single character showing the bug impact, possibly colored
+        """
+        if bug.fixed == revision.sha1:
+            impact = BugImpact.Fixed
+        elif bug.found == revision.sha1:
+            impact = BugImpact.Found
+        elif bug.introduced == revision.sha1:
+            impact = BugImpact.Introduced
+        elif bug in revision.confirmed_issues:
+            impact = BugImpact.Confirmed
+        elif bug in revision.potential_issues:
+            impact = BugImpact.Potential
+        elif bug in revision.missing_sha1_issues:
+            impact = BugImpact.MissingFixedSha1
+        else:
+            impact = BugImpact.NoImpact
+
+        return self._color_text(BugPrinter.IMPACTS[impact][0], bug)
+
+    def _color(self, bug: Bug) -> str:
+        """Return the color associated to a bug. It only depends on the bug key
+        in Jira, in order to be deterministic across runs.
+
+        :param bug: the bug whose color is required
+        :return: the color associated to the bug
+        """
+        if bug not in self._colors:
+            index = sum(bytearray(bug.issue.key, encoding="UTF-8")) % len(
+                BugPrinter.COLORS
+            )
+            self._colors[bug] = BugPrinter.COLORS[index]
+        return self._colors[bug]
+
+    def _color_text(self, text: str, bug: Bug) -> str:
+        """Color the text with the color associated to the bug provided. If
+        needed, associate a color to the bug first.
+        If the printer is configured to ignore colors, no coloring will be
+        done.
+
+        :param text: the text to be colored
+        :param bug: the bug used to retrieve the color
+        :return: same text, colored if needed
+        """
+        return text if self.no_color else f"{self._color(bug)}{text}{self.ENDCOLOR}"
+
+    IMPACTS = {
+        BugImpact.NoImpact: (" ", "no impact of the bug on the revision"),
+        BugImpact.Fixed: ("^", "first revision that contains the fix to the bug"),
+        BugImpact.Found: ("o", "revision where the bug was first identified"),
+        BugImpact.Introduced: ("=", "revision where the bug was introduced"),
+        BugImpact.Confirmed: ("|", "this revision is impacted by the bug"),
+        BugImpact.Potential: (":", "this revision may be impacted by the bug"),
+        BugImpact.MissingFixedSha1: (
+            ".",
+            "this revision may be impacted by the bug, but Jira information is missing for confirmation",
+        ),
+    }
+
+    ENDCOLOR = "\033[0m"
+    current_index = 0
+    COLORS = [
+        "\033[95m",  # purple
+        "\033[94m",  # blue
+        "\033[92m",  # green
+        "\033[93m",  # yellow
+        "\033[96m",  # cyan
+        "\033[91m",  # red
+        "\033[97m",  # white
+    ]
+
+
+def get_bugs(jira: armjira.ArmJira) -> List[Bug]:
+    """Fetches from the Arm Jira instance the list of bugs that have a revision
+    found.
+
+    :param jira: connection to the Jira instance
+    :return: a list of Bug objects wrapping the jira issues
+    """
+
+    # Note: only get the fields that we're going to use. This speeds up the
+    # request drastically!
+    issues = jira.get_issues(
+        'project = GENMP and type = Bug and "Revision Found" is not EMPTY and resolution not in (Duplicate, Rejected)',
+        fields=[
+            "status",
+            "Owner",
+            "Revision Found",
+            "Revision Fixed",
+            "Revision Introduced",
+            "summary",
+            "Resolution Summary",
+        ],
+    )
+    return [Bug(issue) for issue in issues]
+
+
+def get_revisions(repo: Repo, branch: str, since: int):
+    """Retrieve revisions in the given Git repository, and returns them for
+    fast access.
+
+    :param repo: the Git repository to use
+    :param branch: the Git branch to inspect
+    :param since: max number of days to explore in the branch
+    :return: tuple composed of a dict of {sha1: revision} for fast access and
+    a list of the same revisions for ordered access.
+    """
+    revisions: DefaultDict[str, Optional[Revision]] = defaultdict(lambda: None)
+    ordered_revisions: List[Revision] = []
+    for pos, commit in enumerate(
+        repo.iter_commits(rev=branch, since=f"{since} days ago")
+    ):
+        revision = Revision(pos, revisions, commit)
+        revisions[revision.sha1] = revision
+        ordered_revisions.append(revision)
+    return revisions, ordered_revisions
+
+
+def main(args: argparse.Namespace) -> None:
+    "Match bugs in GENMP Jira project to revisions in given repository"
+    checkpoints = [("start", time.time())]
+
+    def time_checkpoint(step: str) -> None:
+        checkpoints.append((step, time.time()))
+
+    repo = Repo(args.dir)
+    time_checkpoint("repo connection")
+    revisions, ordered_revisions = get_revisions(
+        repo, args.branch if "branch" in args else repo.head, args.since
+    )
+    time_checkpoint(f"retrieval of {len(ordered_revisions)} revisions")
+
+    jira = armjira.connect()
+    time_checkpoint("jira connection")
+    bugs = get_bugs(jira)
+    time_checkpoint("jira issues retrieval")
+
+    if args.rev:
+        revision = revisions[short_sha1(repo.commit(rev=args.rev).hexsha)]
+        revision.check_bugs_impact(bugs)
+        time_checkpoint("matching commit")
+
+        printer = BugPrinter(
+            revision.confirmed_issues + revision.potential_issues,
+            args.no_color,
+            args.no_res_summary,
+        )
+
+        if revision.confirmed_issues:
+            print(f"Confirmed issues affecting {args.rev}:")
+            printer.print_bugs(revision.confirmed_issues)
+        else:
+            print(f"No confirmed issues affect {args.rev}")
+
+        print()
+        if revision.potential_issues:
+            print(f"Potential issues affecting {args.rev}:")
+            printer.print_bugs(revision.potential_issues)
+        time_checkpoint("issues printing")
+
+    else:
+        impacting_bugs = set()
+        for revision in ordered_revisions[: args.max_commits]:
+            revision.check_bugs_impact(bugs)
+            impacting_bugs.update(revision.confirmed_issues)
+            impacting_bugs.update(revision.potential_issues)
+            impacting_bugs.update(revision.missing_sha1_issues)
+
+        time_checkpoint("issues and commits matching")
+        printer = BugPrinter(
+            impacting_bugs,
+            args.no_color,
+            args.no_res_summary,
+        )
+
+        if args.legend:
+            printer.print_legend()
+            print()
+            time_checkpoint("printing legend")
+
+        printer.print_bugs(impacting_bugs)
+        time_checkpoint("issues printing")
+
+        print()
+
+        for revision in ordered_revisions[: args.max_commits]:
+            printer.print_revision(revision)
+
+        time_checkpoint("commits printing")
+
+    print("\n")
+    for index, checkpoint in enumerate(checkpoints[1:]):
+        print(
+            f"{index}: {checkpoint[0]} took {checkpoint[1] - checkpoints[index][1]:.4f}"
+        )
+    print(f"Total time: {checkpoints[-1][1] - checkpoints[0][1]:.4f}")
+
+
+def parse_args() -> argparse.Namespace:
+    "Parse and return the arguments given to the script"
+    parser = argparse.ArgumentParser(
+        description="""
+        Match a Git repository history with Jira bugs in GENMP project, according to
+        the fields "Revision Found", "Revision Introduced" and "Revision Fixed".
+    """
+    )
+
+    parser.add_argument(
+        "--dir",
+        type=str,
+        default=Path.cwd(),
+        help="git repository to match with Jira issues",
+    )
+
+    parser.add_argument(
+        "--branch",
+        type=str,
+        help="git branch to analyze. Default is the current branch.",
+    )
+
+    parser.add_argument(
+        "--rev",
+        type=str,
+        metavar="SHA1|TAG",
+        help="""
+            limit the matching with Jira to the specified revision. Can be a sha1, a tag, HEAD...
+            Invalidate options --branch, --max-commits and --legend""",
+    )
+
+    parser.add_argument(
+        "--since",
+        type=int,
+        default=365,
+        metavar="DAYS",
+        help="max number of days to explore in the git history",
+    )
+
+    parser.add_argument(
+        "--max_commits",
+        type=int,
+        default=30,
+        help="number of commits in the Git history to match with Jira bugs",
+    )
+
+    parser.add_argument(
+        "--legend", action="store_true", help="start by explaining the symbols used"
+    )
+
+    parser.add_argument(
+        "--no_color", action="store_true", help="don't use colors to display Jira bugs"
+    )
+
+    parser.add_argument(
+        "--no_res_summary",
+        action="store_true",
+        help="don't display information about bugs resolution summary",
+    )
+
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    try:
+        arguments = parse_args()
+        main(arguments)
+        sys.exit(0)
+    except InvalidGitRepositoryError:
+        print(f"Fatal Error: {Path(arguments.dir).resolve()} is not a Git repository")
+        sys.exit(1)
+    except GitCommandError as exc:
+        print(f"Fatal Error: git command returned status {exc.status}: {exc.stderr}")
+        sys.exit(1)
+    except armjira.connection.AuthenticationError:
+        print(
+            "Cannot connect to Arm Jira instance.\n"
+            "Please check your ~/.netrc file. Requirements for this file are:\n"
+            "- It needs to be in your home directory\n"
+            "- It needs to be called exactly .netrc\n"
+            "- Permissions must be set to 400 or 600 (ie not readable by anyone but you)\n"
+            "- It must contain your credentials to connect to Jira (usual unix login/password) "
+            "for jira.arm.com, such as 'machine jira.arm.com login USERNAME password PASSWORD'\n"
+            "More information with `man netrc` or on "
+            "https://eis.nahpc.arm.com/projects/pd/raven/ArmJiraDocs/latest/setup/authentication.html"
+        )
+        sys.exit(2)

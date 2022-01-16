@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+# -*- python -*-
+# vim: set syntax=python:
+
+"test programm to generate a Litmus Sequence without launching the entire Popeye/GenASM-MP generator"
+
+import argparse
+from os import path
+from json import load, dump, dumps
+from time import time
+from lib_generator.generator_class import PopeyeRandom
+from lib_generator.litmus_sequence import LitmusSequence
+from lib_shared.arm2geninstr import Arm2GenInstr
+from lib_litmus.dummy_objects import DummyLayoutGenerator, DummyPeGenerator, DummyAddressGenerator
+
+def json_dumper(output_dir: str, filename: str, outdict: dict, sort_keys: bool = False) -> None:
+    "function dumpting a dictionary outdict to a file filename in json format"
+    assert path.exists(output_dir), f"The directory {output_dir} doesn't exist"
+
+    output_path = path.join(output_dir, filename)
+
+    assert not path.isfile(output_path), \
+        "File already exists, please delete it manually if you wish to dispose of it"
+
+    with open(output_path, 'w') as outfile:
+        dump(outdict, outfile, sort_keys=sort_keys, indent=4)
+
+def generate_scenario_environment(nb_of_agents_needed, nb_litmus_object):
+    "generate a small generation environment DummyLayoutGenerator + DummyPeGenerators + DummyAddressGenerators"
+    agent_l = []
+    layout_generator = DummyLayoutGenerator()
+    layout_generator.nb_litmus_object = nb_litmus_object
+    assert nb_litmus_object >= 0, "The number of litmus objects needs to be equal to or superior to 0"
+    for i in range(nb_of_agents_needed):
+        agent_name = f"CL0_CPU{i}"
+        layer_name = f"cool_layer{i}"
+        layout_generator.rw_agent_names.append(agent_name)
+        layout_generator.memory_layers[agent_name] = layer_name
+        address_gen = DummyAddressGenerator(agent_name, layer_name)
+        agent_l.append(DummyPeGenerator(agent_name, address_gen))
+
+    return layout_generator, agent_l
+
+
+def output_testmessage(message): # pylint: disable=missing-function-docstring
+    print(f"==> {message}")
+
+def output_differences(dict1, dict2):
+    "Compares the contents of two dictionaries and raises an exception if the dictionaries are not identical."
+    actual = dumps(dict1, sort_keys=False, indent=4)
+    gold = dumps(dict2, sort_keys=False, indent=4)
+    mismatch = {key: dict1[key]
+                for key in dict1.keys() & dict2
+                if dict1[key] != dict2[key]}
+    mismatch2 = {key: dict2[key]
+                 for key in dict2.keys() & dict1
+                 if dict2[key] != dict1[key]}
+    raise Exception(f"The results do not match!\nActual content: {actual}\n\nExpectect content: {gold}\n\nMismatch : {mismatch}\nMismatch : {mismatch2}")
+
+def testing_set_agent_label(litmus_d, debugmode):
+    "Function which tests the 'set_agent_label' method of a LitmusSequence object."
+    print("Starting test 'testing_set_agent_label'")
+    rand_gen = PopeyeRandom()
+    rand_gen.seed(2021)
+    arm2geninstr = Arm2GenInstr()
+    layout_generator, _ = generate_scenario_environment(nb_of_agents_needed=2, nb_litmus_object=2)
+    litmus_sequence = LitmusSequence(rand_gen=rand_gen,
+                                     layout_generator=layout_generator,
+                                     litmus_d=litmus_d,
+                                     arm2geninstr=arm2geninstr)
+
+    for agent_name_popeye in litmus_sequence.layout_generator.rw_agent_names:
+        agent_name_alias = litmus_sequence._pick_agent_alias(agent_name_popeye) # pylint: disable=protected-access
+        if debugmode:
+            output_testmessage(f"Adding {agent_name_popeye} as {agent_name_alias} ...")
+        litmus_sequence.set_agent_label(agent_name_alias, agent_name_popeye)
+
+
+    gold_result = {"arch": "AArch64", "name": "SB004", "input_cycle": "DMB.SYdWR Fre DMB.SYdWR Fre", "cycle": "Fre DMB.SYdWR Fre DMB.SYdWR",
+                   "relax": "DMB.SYdWR", "safe": "Fre", "generator": "diy7 (version 7.56)",
+                   "prefetch": {"CL0_CPU1": {"x": "F", "y": "T"}, "CL0_CPU0": {"y": "F", "x": "T"}},
+                   "com": "Fr Fr", "orig": "DMB.SYdWR Fre DMB.SYdWR Fre",
+                   "litmus": {
+                           "CL0_CPU1": {
+                                   "init": {"X1": {"addr": "x"}, "X3": {"addr": "y"}},
+                                   "instructions": {"list": ["MOV W0,#1", "STR W0,[X1]", "DMB SY", "LDR W2,[X3]"]}
+                           },
+                           "CL0_CPU0": {
+                                   "init": {"X1": {"addr": "y"}, "X3": {"addr": "x"}},
+                                   "instructions": {"list": ["MOV W0,#1", "STR W0,[X1]", "DMB SY", "LDR W2,[X3]"]}
+                           }},
+                   "exists": "(0:X2=0 /\\ 1:X2=0)"
+                  }
+
+    if litmus_sequence.processed_litmus_d != gold_result:
+        output_differences(litmus_sequence.processed_litmus_d, gold_result)
+    else:
+        print("PASSED\n\n")
+
+def testing_set_memory_object_name(litmus_d, debugmode):
+    "Function which tests the 'set_memory_locations' method of a LitmusSequence object."
+    print("Starting test 'testing_set_memory_object_name'")
+    rand_gen = PopeyeRandom()
+    rand_gen.seed(2021)
+    arm2geninstr = Arm2GenInstr()
+    layout_generator, _ = generate_scenario_environment(nb_of_agents_needed=2, nb_litmus_object=2)
+    litmus_sequence = LitmusSequence(rand_gen=rand_gen,
+                                     layout_generator=layout_generator,
+                                     litmus_d=litmus_d,
+                                     arm2geninstr=arm2geninstr)
+
+    agent_name_aliases = [elem for elem in litmus_sequence.litmus_d["litmus"].keys() if elem.startswith("P")]
+    for agent_name_alias in agent_name_aliases:
+        litmus_sequence.set_memory_locations(agent_name_alias)
+        if debugmode:
+            output_testmessage(f"Agent {agent_name_alias} modifying used_address_ids list {litmus_sequence.used_address_ids_l}")
+
+    gold_result = {"arch": "AArch64", "name": "SB004", "input_cycle": "DMB.SYdWR Fre DMB.SYdWR Fre", "cycle": "Fre DMB.SYdWR Fre DMB.SYdWR",
+                   "relax": "DMB.SYdWR", "safe": "Fre", "generator": "diy7 (version 7.56)",
+                   "prefetch": {
+                           "P0": {1: "F", 0: "T"},
+                           "P1": {0: "F", 1: "T"}},
+                   "com": "Fr Fr", "orig": "DMB.SYdWR Fre DMB.SYdWR Fre",
+                   "litmus": {
+                           "P0": {
+                                   "init": {"X1": {"addr": 1}, "X3": {"addr": 0}},
+                                   "instructions": {"list": ["MOV W0,#1", "STR W0,[X1]", "DMB SY", "LDR W2,[X3]"]}
+                           },
+                           "P1": {
+                                   "init": {"X1": {"addr": 0}, "X3": {"addr": 1}},
+                                   "instructions": {"list": ["MOV W0,#1", "STR W0,[X1]", "DMB SY", "LDR W2,[X3]"]}
+                           }},
+                   "exists": "(0:X2=0 /\\ 1:X2=0)"
+                  }
+
+    if litmus_sequence.processed_litmus_d != gold_result:
+        output_differences(litmus_sequence.processed_litmus_d, gold_result)
+    else:
+        print("PASSED\n\n")
+
+def get_args():
+    "parses and returns the specified command line arguments"
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debugmode", action="store_true",
+                        help="Output more information")
+    parser.add_argument("--pudb", action="store_true",
+                        help="Launch with python debugger")
+    parser.add_argument("--debugpy", type=int,
+                        help="Launch with remote capable python debugger")
+    parser.add_argument("--litmuspath",
+                        type=str)
+    return parser.parse_args()
+
+def main(args): # pylint: disable=missing-function-docstring
+
+    if args.pudb:
+        try:
+            import pudb # pylint: disable=import-error,import-outside-toplevel
+            pudb.set_trace()
+        except ImportError as ex:
+            raise RuntimeError("You need to install pudb with the command 'pip3 install pudb --user'") from ex
+    elif args.debugpy:
+        try:
+            import debugpy # pylint: disable=import-error,import-outside-toplevel
+            debugpy.listen(args.debugpy) # Specify port to listen (by default on localhost)
+            print(f"Waiting for debugger attach on port {args.debugpy}")
+            debugpy.wait_for_client() # Wait for the StudioCode debugger to attach
+            debugpy.breakpoint() # Configure a first breakpoint once Attach
+        except ImportError as ex:
+            raise RuntimeError("You need to install debugpy with the command 'pip3 install debugpy --user'") from ex
+
+    start = time()
+
+    if args.litmuspath:
+        litmuspath = args.litmuspath
+        assert path.isfile(litmuspath), f"File {litmuspath} does not exist!"
+        with open(litmuspath, 'r') as file:
+            litmus_d = load(file)
+    else:
+        litmus_d = {
+                "arch": "AArch64", "name": "SB004", "input_cycle": "DMB.SYdWR Fre DMB.SYdWR Fre",
+                "cycle": "Fre DMB.SYdWR Fre DMB.SYdWR", "relax": "DMB.SYdWR", "safe": "Fre", "generator": "diy7 (version 7.56)",
+                "prefetch": {
+                        "P0": {"x": "F", "y": "T"},
+                        "P1": {"y": "F", "x": "T"}
+                },
+                "com": "Fr Fr", "orig": "DMB.SYdWR Fre DMB.SYdWR Fre",
+                "litmus": {
+                        "P0": {"init": {"X1": {"addr": "x"}, "X3": {"addr": "y"}},
+                               "instructions": {"list": ["MOV W0,#1", "STR W0,[X1]", "DMB SY", "LDR W2,[X3]"]}},
+                        "P1": {"init": {"X1": {"addr": "y"}, "X3": {"addr": "x"}},
+                               "instructions": {"list": ["MOV W0,#1", "STR W0,[X1]", "DMB SY", "LDR W2,[X3]"]}}},
+                "exists": "(0:X2=0 /\\ 1:X2=0)"}
+
+
+
+    # print(f"Initial litmus test")
+    # test = dumps(litmus_d, sort_keys=False, indent=4)
+    # print(test)
+
+    # Test 1: implement set_agent_label method from LitmusSequence class
+    testing_set_agent_label(litmus_d, args.debugmode)
+
+    # Test 2: implement set_memory_region method from LitmusSequence class
+    testing_set_memory_object_name(litmus_d, args.debugmode)
+
+    end = time()
+    print(f"Time elapsed in seconds {end - start}")
+
+if __name__ == "__main__":
+    parserargs = get_args()
+    main(parserargs)

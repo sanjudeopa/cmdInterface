@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""
+Diff helper for GenASM-MP
+
+If two test names are given, compare their source files
+If only one is given, compare with last generated test
+If none are given, compare last generated test with and without local changes
+"""
+
+import os
+import shlex
+import argparse
+import subprocess
+
+from lib_gmp.test_history import get_last_test_name
+from lib_gmp.test_name_handler import TestName
+
+def main(args):
+    """
+    main function parsing test name and starting vimdiff
+
+    @param args: named tuple with command line arguments
+    """
+    genasm_path = os.path.join(os.environ.get("POPEYE_HOME"), args.dir)
+
+    nb_test_args = len(args.tests)
+
+    assert 0 <= len(args.tests) <= 2, "Unsupported argument combination"
+
+    if not nb_test_args:
+        left_test_name = get_last_test_name(args.dir)
+
+        # REVISIT(remsau01, GENMP, should consider the 2 last generated tests instead)
+        extracted = TestName.extract(left_test_name)
+        extracted.gitdirty = not extracted.gitdirty
+
+        right_test_name = extracted.encode()
+    elif nb_test_args == 1:
+        left_test_name = args.tests[0]
+        right_test_name = get_last_test_name(args.dir)
+    elif nb_test_args == 2:
+        left_test_name = args.tests[0]
+        right_test_name = args.tests[1]
+
+    command_l = ["vimdiff"]
+    for test_name in (left_test_name, right_test_name):
+        # REVISIT(remsau01, GENMP, how to open alt source file when test is AArch32?)
+        source_file = os.path.join(genasm_path, "tests", test_name, "test.a64.s")
+        assert os.path.exists(source_file), "Couldn't find test source"
+        command_l.append(source_file)
+
+    if args.verbose:
+        print(" ".join(shlex.quote(arg) for arg in command_l))
+
+    subprocess.call(command_l)
+
+def get_args():
+    """
+    helper function to instantiate an L{ArgumentParser}
+
+    @return: a L{namedtuple} instance containing the parsed command line options
+    """
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("tests", nargs="*", help="Tests to compare")
+    parser.add_argument("--dir", default="genasm_mp", help="Subdirectory containing all generated files")
+    parser.add_argument("-v", "--verbose", action="store_true")
+
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    main(get_args())

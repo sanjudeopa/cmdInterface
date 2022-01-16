@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+# pylint: disable=missing-docstring
+
+import sys
+from argparse import ArgumentParser, FileType
+
+from lib_generator.popeye_factory import get_factory
+
+def main(argv):
+    parser = ArgumentParser(description="Split global image68 file into into two S and NS files")
+
+    parser.add_argument("--if", dest="ifile", metavar="FILE",
+                        type=FileType('r'), default=sys.stdin,
+                        help="input data set", required=False)
+
+    parser.add_argument("--ofs", dest="ofiles", metavar="FILE",
+                        type=FileType('w'), default=None,
+                        help="output data set in secure space", required=True)
+
+    parser.add_argument("--ofns", dest="ofilens", metavar="FILE",
+                        type=FileType('w'), default=None,
+                        help="output data set in non-secure space", required=True)
+
+    parser.add_argument("--ofrealm", dest="ofilerealm", metavar="FILE",
+                        type=FileType('w'), default=None,
+                        help="output data set in realm space", required=True)
+
+    parser.add_argument("--ofroot", dest="ofileroot", metavar="FILE",
+                        type=FileType('w'), default=None,
+                        help="output data set in root space", required=True)
+
+    parser.add_argument("--oftags", dest="ofiletags", metavar="FILE",
+                        type=FileType('w'), default=None,
+                        help="output tag set in secure space", required=True)
+
+    parser.add_argument("--oftagns", dest="ofiletagns", metavar="FILE",
+                        type=FileType('w'), default=None,
+                        help="output tag set in non-secure space", required=True)
+
+    parser.add_argument("--oftagrealm", dest="ofiletagrealm", metavar="FILE",
+                        type=FileType('w'), default=None,
+                        help="output tag set in realm space", required=True)
+
+    parser.add_argument("--oftagroot", dest="ofiletagroot", metavar="FILE",
+                        type=FileType('w'), default=None,
+                        help="output tag set in root space", required=True)
+
+    parser.add_argument("--project", dest="project", type=str, default=None,
+                        help="project name", required=True)
+
+    args = parser.parse_args(argv)
+
+    imp_def_const = get_factory(args.project).get_imp_def_const()
+
+    def is_addr(line):
+        return line[0] == '1'
+
+    def is_end_file(line):
+        return line[0] == '2'
+
+    def get_ofile(line, tag):
+        nse_ns = (int(line, 16) & (3 << imp_def_const.NS_BIT_POSITION)) >> imp_def_const.NS_BIT_POSITION
+        if nse_ns == 0b00:
+            return args.ofiletags if tag else args.ofiles
+        if nse_ns == 0b01:
+            return args.ofiletagns if tag else args.ofilens
+        if nse_ns == 0b11:
+            return args.ofiletagrealm if tag else args.ofilerealm
+        return args.ofiletagroot if tag else args.ofileroot
+
+    def mask_addr(line):
+        return int(line, 16) & ((1 << imp_def_const.NS_BIT_POSITION) - 1)
+
+    tag_space = False
+    for line in args.ifile:
+        if is_addr(line):
+            ofile = get_ofile(line, tag_space)
+            ofile.write("1{:016x}\n".format(mask_addr(line)))
+        elif is_end_file(line):
+            ofile.write(line)
+            tag_space = True
+        else:
+            ofile.write(line)
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

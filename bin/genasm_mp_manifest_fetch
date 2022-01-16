@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""
+Download manifest file for a project
+"""
+import argparse
+
+from lib_gmp.gmp_consts import RUN_PROJECTS
+from lib_gmp.manifests import get_manifest_sha1_and_content
+
+def parse_args():
+    """
+    Return namedtuple mapping the command line arguments
+    """
+    parser = argparse.ArgumentParser(description="download manifest file")
+    parser.add_argument("--output",
+                        type=str,
+                        help="path to save the manifest",
+                        required=True)
+    parser.add_argument("--project_run",
+                        type=str,
+                        choices=RUN_PROJECTS,
+                        help="targetted project_run",
+                        required=True)
+    parser.add_argument("--revision",
+                        type=str,
+                        default='stable',
+                        help="manifest revision: branch or sha1. default=stable")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    _, manifest_content = get_manifest_sha1_and_content(args.revision, f'nahpc2/{args.project_run}')
+    with open(args.output, 'wb') as fh:
+        fh.write(manifest_content)

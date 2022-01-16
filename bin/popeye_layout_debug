@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+# pylint: disable=missing-docstring
+
+import sys
+import argparse
+import pickle
+
+from lib_generator.const_tbench import Constants
+from lib_generator.layout_consts import TranslationError, LayerPhysical
+
+def main(args):
+    if args.debugpy:
+        import debugpy # pylint: disable=import-error,import-outside-toplevel
+        debugpy.listen(args.debugpy) # Specify port to listen (by default on localhost)
+        print(f"Waiting for debugger attach on port {args.debugpy}")
+        debugpy.wait_for_client() # Wait for the StudioCode debugger to attach
+        debugpy.breakpoint() # Configure a first breakpoint once Attach
+
+    layout_generator = pickle.load(args.layout_pickle)
+
+    if args.list:
+        print("layer list:")
+        for layer_name, layer in layout_generator.memory_layers.items():
+            print(" - {:s}:".format(layer_name))
+
+    layer = layout_generator[args.layer]
+    if not layer:
+        raise SystemExit("layer '{}' could not be found".format(args.layer))
+
+    address = args.address
+    if address is None:
+        raise SystemExit("address is required")
+
+    print("debugging address: {:#x}@{:s}".format(address, layer.get_name()))
+
+    if args.translate_down:
+        print("translate down:")
+        try:
+            security_space, physical_address = layer.get_address_lowest(address)
+            print(" -> {:#x}:{:s}".format(physical_address, str(security_space)))
+        except TranslationError as ex:
+            print(str(ex))
+
+    if args.translate_up: # pylint: disable=too-many-nested-blocks
+        print("translate up:")
+        try:
+            for layer, virtual_address in layer.get_address_higher(address, agent=args.restrict_agent, exclude_aliases=args.exclude_aliases):
+                print(" -> {:#x}@{:s}".format(virtual_address, layer.get_name()))
+                if layer.get_stage():
+                    desc = layer.get_address_descriptor(virtual_address)
+                    if desc:
+                        for line in desc.dump_tables(args.verbose):
+                            print("    {}".format(line))
+        except TranslationError as ex:
+            print(str(ex))
+
+    if args.page_table_walk:
+        print("page table walk:")
+        try:
+            for security_space, physical_address in layer.get_address_walk(address):
+                print(" -> {:#x}:{:s}".format(physical_address, str(security_space)))
+        except TranslationError as ex:
+            print(str(ex))
+
+def get_args(argv):
+    def auto_int(arg):
+        return int(arg, 0)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--layout-pickle", type=argparse.FileType("rb"), default=Constants.PICKLE_LAYOUT,
+                        help="the path to the 'pickle' file which contains machine readable version of the entire layout")
+    parser.add_argument("-i", "--list", action="store_true",
+                        help="list all translation regimes that exist in this layout")
+    parser.add_argument("--debugpy",
+                        type=int,
+                        help="Launch with VSCode python debugger")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="print more information")
+
+    input_group = parser.add_argument_group("Address Input")
+    input_group.add_argument("-a", "--address", type=auto_int,
+                             help="the address that is investigated by the debugging operations")
+    input_group.add_argument("-l", "--layer", type=str, default=LayerPhysical.SECURE,
+                             help="the layer/translation-regime of the specified address. "
+                                  "the name of the layer consists of a concatenation of the agent's name, the EL, and the translation stage. "
+                                  "possible values can be listed by using the '-l'/'--list' option")
+    input_group.add_argument("-r", "--restrict-agent", type=str,
+                             help="for upwards translations, only consider layouts of this agent (e.g. CL0_CPU0)")
+    input_group.add_argument("--exclude-aliases", action="store_true",
+                             help="for upwards translations, only consider layouts that are not aliases")
+
+    operation_group = parser.add_argument_group("Address Operations")
+    operation_group.add_argument("-d", "--translate-down", action="store_true",
+                                 help="translate the specified address downwards (i.e. VA/IPA to PA)")
+    operation_group.add_argument("-u", "--translate-up", "--translate", action="store_true",
+                                 help="translate the specified address upwards (i.e. PA to IPA to VA)")
+    operation_group.add_argument("-w", "--page-table-walk", action="store_true",
+                                 help="print all addresses that might be touched by a page-table-walk if the given address is accessed")
+
+    return parser.parse_args(argv)
+
+if __name__ == "__main__":
+    main(get_args(sys.argv[1:]))

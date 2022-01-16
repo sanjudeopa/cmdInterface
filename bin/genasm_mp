@@ -1,0 +1,2314 @@
+#!/usr/bin/env python3
+
+# pylint: disable=missing-docstring
+# pylint: disable=invalid-name
+# pylint: disable=too-many-lines
+# pylint: disable=too-many-statements
+# pylint: disable=too-many-branches
+# pylint: disable=too-many-locals
+# pylint: disable=too-many-instance-attributes
+# pylint: disable=too-many-boolean-expressions
+# pylint: disable=too-few-public-methods
+
+import pathlib
+import sys
+import stat
+import signal
+import os
+import time
+import argparse
+import pdb
+import traceback
+import socket
+import json
+import uuid
+import random
+import subprocess
+import re
+import shlex
+import pstats
+from cProfile import Profile
+import glob
+import shutil
+import hashlib
+
+from lib_gmp.results import results, decode_returncode
+from lib_gmp.gmp_consts import PROJECTS, RUN_PROJECTS, get_project_run_alias, MAX_NB_CPUS, get_interrupt_loopback_d
+from lib_gmp.versioning import last_but_not_least, get_git_environment
+from lib_gmp.manifests import fetch_manifest_to_dir, get_component_revisions_from_manifest, are_manifest_components_available
+from lib_gmp.split_elf import split_elf
+from lib_gmp.fake_build_options import FakeBuildOptions
+from lib_gmp.fastsim_command_constructor import fastsim_cfg_factory
+from lib_gmp.patch_elf import get_patch_args, patch_elf_file
+from lib_gmp.test_name_handler import TestName, UnmatchedTestNameException
+from lib_gmp.test_history import set_last_test_name
+from lib_gmp.upload_eap import SessionSchema, RISGenSchema, DynamicTestSchema, UploadSkippedException, djb2_hash
+from lib_gmp.test_directory import resetenv, postclean, ELF_TO_SECURITY
+from lib_gmp.utb_command_constructor import utb_cfg_factory
+from lib_gmp.libs_compile import clean_suite, compile_and_link
+
+from lib_generator.statistics_common import for_test, for_agent
+from lib_generator.base_exceptions import GenerationException
+from lib_generator.generator_class import Generator
+from lib_generator.popeye_factory import get_factory
+
+from lib_shared.popeye_common import si_unit, SecuritySpace
+from lib_shared.const_log import getStdoutLogger, initFileHandler, setLevel
+from lib_shared.config_requirements import get_default_requirements, RequirementNotFulfilled
+
+LOGGER = getStdoutLogger()
+
+stats = for_test()
+
+class ProcessReader:
+    def __init__(self, fd):
+        self.fd = fd
+
+    def __iter__(self):
+        while True:
+            line = self.fd.readline()
+            if line:
+                yield line.rstrip("\n\r")
+            else:
+                break
+
+class TestRunException(Exception):
+    retcode = 1
+
+class FailureException(TestRunException):
+    retcode = 10
+
+class UndecidedException(TestRunException):
+    retcode = 11
+
+class ReturnCodeException(TestRunException):
+    retcode = 12
+
+class TimeoutException(TestRunException):
+    retcode = 13
+
+class InterruptException(TestRunException):
+    retcode = 14
+
+class TerminateException(TestRunException):
+    retcode = 15
+
+class LSFTimeoutException(TestRunException):
+    retcode = 16
+
+class LSFMemoryException(TestRunException):
+    retcode = 17
+
+class LSFFileException(TestRunException):
+    retcode = 17
+
+def exception_to_str(ex):
+    ex_str = str(ex)
+    return ex_str if ex_str else ex.__class__.__name__
+
+def fix_args(args):
+    if args.test:
+        try:
+            LOGGER.info("Extracting test parameters from specified test name")
+            extracted = TestName.extract(args.test)
+        except UnmatchedTestNameException:
+            LOGGER.error("Specified test name must be valid")
+            raise
+
+        args.nb_cluster = extracted.clusters
+        args.nb_cpu = extracted.cpus
+        args.threads_per_cpu = extracted.threads
+        args.nb_rn_bfm = extracted.rnbfms
+        args.nb_acp = extracted.acps
+        args.seed = extracted.seed
+        args.project = extracted.project
+        args.project_core = extracted.project_cores
+        args.configs = extracted.configs
+
+    if not args.project_run:
+        args.project_run = get_project_run_alias(args.project)
+
+    return args
+
+def parse_args():
+    parser_shared = argparse.ArgumentParser(description="Parser for genasm_mp")
+
+
+    parser_shared.add_argument("test", nargs="?", help="Test to generate. If specified, will be decoded to configure generation")
+    parser_shared.add_argument("--arg_file", type=str, help="read arguments from file")
+
+    #Required arguments
+    parser_shared.add_argument("--configs",
+                               type=str,
+                               nargs="+",
+                               default=[],
+                               help="config files that provide generation options for the generator")
+
+    #Generation Options
+    #------------------
+    group_generation = parser_shared.add_argument_group('Generation options')
+    group_generation.add_argument("--seed", "-s",
+                                  type=int,
+                                  default=random.randrange(1 << 32),
+                                  metavar="S",
+                                  help="Specify a seed to be used (default: None yet)")
+    group_generation.add_argument("--nb_cpu",
+                                  type=int,
+                                  default=2,
+                                  choices=list(range(MAX_NB_CPUS+1)),
+                                  help="targetted number of cores per cluster")
+    group_generation.add_argument("--nb_rn_bfm",
+                                  type=int,
+                                  default=0,
+                                  choices=[0, 1, 2, 3, 4],
+                                  help="targetted number of VIP RN BFM")
+    group_generation.add_argument("--nb_acp",
+                                  type=int,
+                                  default=0,
+                                  choices=[0, 1, 2],
+                                  help="targetted number of ACP agent per cluster")
+    group_generation.add_argument("--threads_per_cpu", "--threads_per_core",
+                                  type=int,
+                                  default=1,
+                                  choices=[1, 2, 3, 4, 6, 8],
+                                  help="targetted number of thread per core for multi_threaded cpus")
+    group_generation.add_argument("--nb_cluster",
+                                  type=int,
+                                  default=1,
+                                  choices=[1, 2, 4, 6, 8],
+                                  help="targetted number of clusters")
+    group_generation.add_argument("--override",
+                                  type=str,
+                                  nargs="+",
+                                  default=[],
+                                  help="Override a configuration settings with fixed values. key_1=val_1 [key_2=val_2 [...]]")
+    group_generation.add_argument("--pdb",
+                                  action="store_true",
+                                  help="Launch with python debugger")
+    group_generation.add_argument("--pudb",
+                                  action="store_true",
+                                  help="Launch with more awesome python debugger")
+    group_generation.add_argument("--debug-help",
+                                  action="store_true")
+    group_generation.add_argument("--disass",
+                                  action="store_true",
+                                  help="Disassemble produced ELF with objdump in disass dir")
+    group_generation.add_argument("--human",
+                                  action="store_true",
+                                  help="Spend time writing files for human debug.")
+    group_generation.add_argument("--no_human",
+                                  action="store_true",
+                                  help="This is deprecated (default behavior)")
+
+    group_generation = parser_shared.add_argument_group('Tool actions')
+    group_generation.add_argument("--keep_libs",
+                                  action="store_true",
+                                  help="Dont clean C librairies before compile")
+    group_generation.add_argument("--resetenv",
+                                  action="store_true",
+                                  help="reset POPEYE/genasm_mp directory structure and link rtl dir if possible")
+    group_generation.add_argument("--short_cfg",
+                                  action="store_true",
+                                  help="use a shortended hash instead of full config names to build test name")
+
+    group_generation = parser_shared.add_argument_group('Simulation Target')
+    group_generation.add_argument("--project",
+                                  type=str,
+                                  choices=PROJECTS,
+                                  help="targeted project (will select disable_files to use")
+    group_generation.add_argument("--project_run",
+                                  type=str,
+                                  choices=RUN_PROJECTS,
+                                  help="use a different project for running the test than for creation (useful for fake CPUs like zermatt)")
+    group_generation.add_argument("--project_core",
+                                  type=str,
+                                  nargs="*",
+                                  help="use a different project for each core in the system. <cluster>:<cpu>:project [<cluster>:<cpu>:project [...]]")
+
+    group_generation.add_argument("--fastsim", "--ctares",
+                                  action="store_true",
+                                  help="launch test with fastsim")
+    group_generation.add_argument("--acme",
+                                  action="store_true",
+                                  help="launch test with ACME")
+    group_generation.add_argument("--minitb",
+                                  action="store_true",
+                                  help="Compile test for minitb")
+
+    group_generation = parser_shared.add_argument_group('UTB options')
+    group_generation.add_argument("--utb",
+                                  action="store_true",
+                                  help="Launch test on the UTB")
+    group_generation.add_argument("--build_rtl",
+                                  action="store_true",
+                                  help="Compile the RTL before launching the test")
+    group_generation.add_argument("--update_rtl",
+                                  action="store_true",
+                                  help="Update the RTL before compiling it")
+    group_generation.add_argument("--simopts",
+                                  type=str,
+                                  nargs="+",
+                                  default=[],
+                                  help="Add more simopts to the RTL run")
+    group_generation.add_argument("--sim",
+                                  type=str,
+                                  default="mti",
+                                  help="Simulator to use when RTL sim [ mti (default) | vcs ]")
+    group_generation.add_argument("--bo",
+                                  type=str,
+                                  help="Use a specific build option for UTB")
+    group_generation.add_argument("--maxruncycles",
+                                  type=int,
+                                  default=0,
+                                  help="Kill validation simulation after x cycles")
+    group_generation.add_argument("--tb_seed",
+                                  type=int,
+                                  default=0,
+                                  help="Force the seed used by validation (--simopts tb_seed=xxx)")
+    group_generation.add_argument("--fsdb",
+                                  action="store_true",
+                                  help="simulation with fsdb")
+    group_generation.add_argument("--logmem",
+                                  action="store_true",
+                                  help="Log memory access")
+    group_generation.add_argument("--dcc",
+                                  action="store_true",
+                                  help="launch test with DCC (data coherency checker)")
+
+    group_generation = parser_shared.add_argument_group('All testbench options')
+    group_generation.add_argument("--manifest",
+                                  type=str,
+                                  default="stable",
+                                  help="[<manifest repo branch or sha1> | <path to manifest file>]")
+    group_generation.add_argument("--tarmac",
+                                  action="store_true",
+                                  help="launch test with univent tarmac plugin")
+    group_generation.add_argument("--evs",
+                                  action="store_true",
+                                  help="If tarmac plugin is enabled, also generate EVS files")
+    group_generation.add_argument("--tarmactext",
+                                  action="store_true",
+                                  help="launch test with tarmactext plugin")
+    group_generation.add_argument("--tarmactrace",
+                                  action="store_true",
+                                  help="launch test with tarmactrace plugin")
+    group_generation.add_argument("--generictrace",
+                                  action="store_true",
+                                  help="launch test with generictrace plugin")
+    group_generation.add_argument("--addrextract",
+                                  action="store_true",
+                                  help="Optional switch passed to tarmactrace to make the output in the format needed by Address Extract")
+    group_generation.add_argument("--fill_zeroes",
+                                  action="store_true",
+                                  help="Force preload memory IN SIMULATION with 0x00000000 instead of default 0xffa7beec "
+                                       "(fastsim, UTB, isscmp, mp_data_checker, dcc).\n"
+                                       "Note: To preinit memory with fixed value in generator, "
+                                       "use MEM_NOT_INIT_BY_SOFT_IS_KNOWN=True and set MEM_DEFAULT_INIT_VALUE")
+    group_generation.add_argument("--maxgentime",
+                                  type=int,
+                                  default=10,
+                                  help="Kill generation after x minutes")
+    group_generation.add_argument("--maxruntime",
+                                  type=int,
+                                  help="Kill launched test after x minutes")
+    group_generation.add_argument("--acme_config",
+                                  type=str,
+                                  default="",
+                                  help="specify ACME config file")
+    group_generation.add_argument("--gmpxcmp",
+                                  action="store_true",
+                                  help="run genasm_mp_exec_compare against fastsim simulation. Needs --fastsim --tarmac --evs")
+
+    group_generation = parser_shared.add_argument_group('RTL Simulation top level checkers')
+    group_generation.add_argument("--isscmp",
+                                  action="store_true",
+                                  help="launch test with isscmp")
+    group_generation.add_argument("--ecc",
+                                  action="store_true",
+                                  help="Tell validation to activate ecc error injection")
+
+    group_generation = parser_shared.add_argument_group('MiniTB options')
+    group_generation.add_argument("--minitb_dir",
+                                  type=str,
+                                  default=None,
+                                  help="Specify mini_tb's home directory, has to be used with resetenv")
+    group_generation.add_argument("--minitb_simbuild",
+                                  type=str,
+                                  nargs="+",
+                                  default=[],
+                                  help="Specify non standard RTL simbuild")
+    group_generation.add_argument("--minitb_sconfig",
+                                  type=str,
+                                  nargs="+",
+                                  default=[],
+                                  help="add more sconfigs to validation command")
+
+    group_generation = parser_shared.add_argument_group('Fpga options')
+    group_generation.add_argument("--fpga_run",
+                                  type=str,
+                                  const="last",
+                                  nargs="?",
+                                  help="launch test with fpga-run. --fpga_board and --fpga_image must also be specified. Optional argument:"
+                                       "['last': latest fpga-run version (default) | <str>: specific fpga-run revision (or custom path) ]")
+    group_generation.add_argument("--fpga_hex",
+                                  action="store_true",
+                                  help="Generate hex payloads for fpga-run")
+    group_generation.add_argument("--fpga_image",
+                                  type=str)
+    group_generation.add_argument("--fpga_board",
+                                  type=str)
+    group_generation.add_argument("--fpga_options",
+                                  type=str,
+                                  nargs="+",
+                                  default=[],
+                                  help="extra options to add to fpga-run command")
+
+    group_generation = parser_shared.add_argument_group('Expert user only options')
+    group_generation.add_argument("--postclean",
+                                  action="count",
+                                  default=0,
+                                  help="If no error, save disk space, 0:clean nothing, 1:clean .s .o logs, 2: clean all produced")
+    group_generation.add_argument("--force_clean",
+                                  action="store_true",
+                                  help="postclean even if the test failed, needs --postclean")
+    group_generation.add_argument("--skipgen",
+                                  action="store_true",
+                                  help="Skip test generation step")
+    group_generation.add_argument("--skipmake",
+                                  action="store_true",
+                                  help="Skip test compilation / make step")
+    group_generation.add_argument("--skiprun",
+                                  action="store_true",
+                                  help="Skip test run on MiniTB step")
+    group_generation.add_argument("--dir",
+                                  type=str,
+                                  default="genasm_mp",
+                                  help="subdirectory containing all generated files")
+    group_generation.add_argument("--name",
+                                  type=str,
+                                  help="custom name for the generated test")
+    group_generation.add_argument("--patch",
+                                  type=str,
+                                  nargs="*",
+                                  help="patch values in the generated ELF files. <field>=<value> [<field>=<value> [...]]")
+
+    group_eap = parser_shared.add_argument_group('EAP upload options')
+    group_eap.add_argument("--regr_rid",
+                           type=uuid.UUID,
+                           help="EAP result ID of the regression this test belongs to. Setting this enables EAP upload")
+    group_eap.add_argument("--eap_project",
+                           type=str,
+                           default="genasm_qa",
+                           help="EAP project under which results will be uploaded")
+    group_eap.add_argument("--eap_prod",
+                           action="store_true",
+                           help="Upload to EAP production server")
+    group_generation.add_argument("--eap_lsfproject",
+                                  type=str,
+                                  help="LSF project code (for EAP uploads)")
+
+
+    #Display Options
+    #------------------
+    group_display = parser_shared.add_argument_group('Display options')
+    group_display.add_argument("--verbose_level", "-v",
+                               action="count",
+                               default=0,
+                               help="Increases verbosity.")
+    group_display.add_argument("--profile",
+                               type=str,
+                               const="genasm_mp_profile.out",
+                               nargs="?")
+
+    args = parser_shared.parse_args()
+
+    if args.arg_file:
+        try:
+            index = int(os.getenv("LSB_JOBINDEX"))
+        except (TypeError, ValueError) as ex:
+            raise ValueError("invalid argument list") from ex
+
+        results["job_index"] = index
+
+        with open(args.arg_file) as args_fd:
+            for line in args_fd:
+                line = line.strip()
+
+                if not line or line.startswith("#"):
+                    continue
+
+                parts = line.split()
+                if int(parts[0]) == index:
+                    args_l = parts[1:]
+                    LOGGER.info("read args [%d] [%s]", index, " ".join(args_l))
+                    args = parser_shared.parse_args(args_l, args)
+                    break
+            else:
+                raise IndexError("run index not found")
+
+    # TODO(papkan01, GENMP-419, check that this works with threads_per_core != 0)
+    if args.project_core:
+        cores = set((cluster, cpu) for cluster in range(args.nb_cluster) for cpu in range(args.nb_cpu))
+        if cores ^ TestName.extract_projects_per_cluster_cpu(args.project_core).keys():
+            parser_shared.error('incompatible --project_core {} and --nb_cluster {} --nb_cpu {}'.format(' '.join(args.project_core),
+                                                                                                        args.nb_cluster,
+                                                                                                        args.nb_cpu))
+
+    if args.gmpxcmp:
+        # we can easily determine location of the evs files when running fastsim test with --evs:
+        assert args.fastsim and args.evs and args.tarmac, '--gmpxcmp: only tests with --fastsim --evs --tarmac are supported'
+        assert args.threads_per_cpu == 1, '--gmpxcmp: multithreaded cpus not supported because not sure how to determine evs file name'
+
+    if os.path.exists(args.manifest):
+        args.manifest = os.path.abspath(args.manifest)
+
+    if args.force_clean and not args.postclean:
+        parser_shared.error("--force_clean needs --postclean")
+
+    return args
+
+# REVISIT(remsau01, GENMP, remove IMPLICIT_CONFIGS workaround)
+def fix_test_configs(configs):
+    """
+    Not mandatory to put test_all and disable on command line anymore
+    """
+    if not configs or configs[0] != "test_all":
+        configs.insert(0, "test_all")
+
+    if configs[-1] != "disable":
+        configs.append("disable")
+
+def get_environment(sub_dir):
+    results["hostname"] = socket.getfqdn()
+
+    results["popeye_path"] = popeye_path = os.environ.get("POPEYE_HOME")
+    assert popeye_path is not None, "popeye_path not found for environment"
+
+    results["genasm_mp_path"] = genasm_mp_path = os.path.join(popeye_path, os.path.normpath(sub_dir))
+    assert genasm_mp_path is not None, "genasm_mp_path not found for environment"
+
+    _, popeye_git_sha1, popeye_git_desc = get_git_environment(popeye_path)
+    LOGGER.info("POPEYE_GIT_SHA1: %s", popeye_git_sha1)
+    results["popeye_git_sha1"] = popeye_git_sha1
+    LOGGER.info("POPEYE_GIT_DESCRIBE: %s", popeye_git_desc)
+    results["popeye_git_desc"] = popeye_git_desc
+
+    return popeye_path, genasm_mp_path
+
+def generate_loopback_file(total_cpus):
+    "generate the loopback file for timer->irq loopback"
+
+    with open("fastsim_loopback.json", "w") as loopback_fd:
+        json.dump(get_interrupt_loopback_d(total_cpus), loopback_fd, indent=2)
+
+def get_test_elfs(only_secure=False):
+    elves = {
+            security_space: file_name
+            for file_name, security_space in ELF_TO_SECURITY
+            if os.path.exists(file_name)
+    }
+
+    assert elves, "Cannot find any test ELF"
+
+    if only_secure:
+        assert len(elves) == 1 and SecuritySpace.S in elves, "Only a single test ELF is supported"
+
+    return elves
+
+def split_elf_in_hexes(elf_path):
+    "Split test ELF into hex files if not present. Returns tuple of boot and body hex paths"
+
+    boot_path = "test.boot.hex"
+    body_path = "test.body.hex"
+
+    LOGGER.info("Generating boot/body hex files")
+    with open(elf_path, "rb") as elf_fd:
+        split_elf(elf_fd, boot_path, body_path)
+
+    return boot_path, body_path
+
+def get_total_cpus(args):
+    return args.nb_cluster * args.nb_cpu if args.nb_cpu else 0
+
+def generate_a_test(build_options,
+                    args,
+                    test_name,
+                    short_test_name,
+                    genasm_mp_path):
+    LOGGER.info("""
+------------------------------------------------------
+------               GENERATE TEST                ----
+------------------------------------------------------""")
+
+    results["override"] = args.override
+
+    results["test"] = args.configs
+    time_start = time.time()
+    nb_inst = None
+
+    try:
+        config_requirements = get_default_requirements(args.project, "genasm_mp")
+        try:
+            config_requirements.check_fulfillment_for(args.configs)
+        except RequirementNotFulfilled as ex:
+            raise GenerationException(f"Config requirement '{str(ex.requirement)}' is not fullfilled") from ex
+
+        g = Generator(
+                args.project,
+                build_options,
+                args.seed,
+                args.configs,
+                args.override,
+                "genasm_mp",
+                args.human,
+                args.verbose_level,
+                debug_help=args.debug_help,
+        )
+
+        results["generation_started"] = True
+        results.dump()
+
+        g.randomize_all(test_name=test_name,
+                        short_test_name=short_test_name)
+
+        if args.skipgen:
+            return g
+
+        if not (args.pdb or args.pudb) and not args.debug_help: # don't set the alarm when we are debugging
+            signal.alarm(args.maxgentime * 60)
+
+        g.generate_all()
+
+        g.check_asserts()
+        results["generation_selfcheck_score"] = g.get_selfcheck_scores()
+
+        signal.alarm(0)
+
+        has_bfm = args.nb_rn_bfm > 0 or args.nb_acp > 0
+
+        if has_bfm or args.ecc:
+            g.write_popeye_elf(name="popeye.o", init_mem=args.nb_cpu == 0)
+
+        if has_bfm and args.human:
+            g.write_popeye_human()
+
+        nb_inst = sum(for_agent(agent).get("nb_instructions_generated", 0) for agent in stats["agents"])
+
+    except TimeoutException:
+        results["generation_timeout"] = True
+        raise
+
+    except InterruptException:
+        results["generation_interrupted"] = True
+        raise
+
+    except LSFTimeoutException:
+        results["generation_lsf_timeout"] = True
+        raise
+
+    except LSFMemoryException:
+        results["generation_lsf_memory"] = True
+        raise
+
+    except LSFFileException:
+        results["generation_lsf_file"] = True
+        raise
+
+    except (GenerationException, AssertionError) as ex:
+        results["generation_exception"] = exception_to_str(ex)
+        traceback.print_exc()
+        raise TestRunException from ex
+
+    finally:
+        time_taken = time.time() - time_start
+        results["generation_time"] = time_taken
+        stats["generation_time"] = time_taken
+
+    if nb_inst:
+        generation_rate = nb_inst // time_taken
+        results["generation_rate"] = generation_rate
+
+        LOGGER.info("Generated %d instructions in %s (%s)",
+                    nb_inst, si_unit(time_taken, "s"),
+                    si_unit(generation_rate, "instructions/s"))
+
+    results["generation_done"] = True
+    LOGGER.info("Generation finished")
+
+    with open("{0:s}/stats/{1:s}.json".format(genasm_mp_path, short_test_name), "w") as stats_fd:
+        json.dump(stats, stats_fd, indent=2, sort_keys=True, separators=(',', ': '))
+
+    return g
+
+def patch_a_test(patch_l):
+    LOGGER.info("""
+------------------------------------------------------
+----             PATCH GENERATED TEST              ---
+------------------------------------------------------""")
+
+    patch_items = []
+
+    # reconstruct list of patches as a compliant argv list
+    for setting in patch_l:
+        if "=" in setting:
+            field, value = setting.split("=")
+            patch_items.append("--{}".format(field))
+            if value is not None:
+                patch_items.append(value)
+        else:
+            patch_items.append("--{}".format(setting))
+
+    # process args
+    p_args = get_patch_args(patch_items)
+
+    elf_files = get_test_elfs(only_secure=True)
+
+    elf_secure = elf_files[SecuritySpace.S]
+
+    with open(elf_secure, 'r+') as elf:
+        LOGGER.info("Patching %s", elf_secure)
+        patch_elf_file(elf, p_args, p_args.checksum_skip, p_args.checksum_incl, p_args.checksum_symbol, p_args.global_infoblock_symbol, p_args.verbose)
+
+    elf_non_secure = elf_files.get(SecuritySpace.NS)
+    if elf_non_secure:
+        with open(elf_non_secure, 'r+') as elf:
+            LOGGER.info("Patching %s", elf_non_secure)
+            patch_elf_file(elf, p_args, p_args.checksum_skip, p_args.checksum_incl, p_args.checksum_symbol, p_args.global_infoblock_symbol, p_args.verbose)
+
+def compile_a_test(args, popeye_path):
+    LOGGER.info("""
+------------------------------------------------------
+------  COMPILE GENERATED TEST                    ----
+------------------------------------------------------""")
+
+    with open("compilation.json", "r") as defines_fd:
+        defines = json.load(defines_fd)["defines"]
+
+    defines["SUB_DIR"] = args.dir
+
+    if args.nb_rn_bfm > 0 or args.nb_acp > 0 or args.ecc:
+        defines["POPEYEELF"] = 1
+
+    if "platform_checker" in args.configs:
+        defines["PLATFORM_CHECKER"] = 1
+
+    time_start = time.time()
+
+    try:
+        results["compilation_started"] = True
+        results.dump()
+        if not args.keep_libs:
+            clean_suite(pathlib.Path(popeye_path),
+                        args.dir,
+                        defines["SUITE"])
+
+        def report_frankenlink_exception(line):
+            if "lib_generator.elf" in line: # frankenlink exceptions
+                results["compilation_exception"] = line
+
+        compile_and_link(pathlib.Path(popeye_path),
+                         defines,
+                         args.disass,
+                         line_callback=report_frankenlink_exception)
+    except TimeoutException:
+        results["compilation_timeout"] = True
+        raise
+
+    except InterruptException:
+        results["compilation_interrupted"] = True
+        raise
+
+    except LSFTimeoutException:
+        results["compilation_lsf_timeout"] = True
+        raise
+
+    except LSFMemoryException:
+        results["compilation_lsf_memory"] = True
+        raise
+
+    except LSFFileException:
+        results["compilation_lsf_file"] = True
+        raise
+
+    except ReturnCodeException:
+        raise
+
+    except subprocess.CalledProcessError as ex:
+        results["compilation_returncode"] = decode_returncode(ex.returncode)
+        raise ReturnCodeException() from ex
+
+    except Exception as ex:
+        results["compilation_exception"] = exception_to_str(ex)
+        raise
+
+    finally:
+        signal.alarm(0)
+
+        time_taken = time.time() - time_start
+        results["compilation_time"] = time_taken
+
+    results["compilation_done"] = True
+
+def fastsim_a_test(args, popeye_path):
+    LOGGER.info("""
+------------------------------------------------------
+------  SIMULATE GENERATED TEST WITH FASTSIM      ----
+------------------------------------------------------""")
+
+    genasm_mp_path = os.path.join(popeye_path, args.dir)
+
+    # Fetch the required metadata for the Fastsim execution
+    with open("fastsim.json", "r") as json_fd:
+        fastsim_options = json.load(json_fd)["fastsim_options"]
+
+        # WFINOP chicken bit (one value per agent)
+        wfi_is_nop_d = fastsim_options["wfinop"]
+        # Either all agents consider WFI as NOP either noone does it, Fastsim only support
+        # a global enabler
+        assert all(wfi_is_nop_d.values()) or not any(wfi_is_nop_d.values()), \
+                "Heterogenous configuration unsupported by Fastsim, you must disable WFINOP chicken bit on all agents"
+        # Ensured that all values are equals, get the first one
+        wfi_is_nop = sorted(wfi_is_nop_d.values())[0] if len(wfi_is_nop_d.values()) > 0 else False
+
+    arch_const = get_factory(args.project).get_arch_const()
+    imp_def_const = get_factory(args.project).get_imp_def_const()
+
+    fastsim_params = {
+            'addrextract': args.addrextract,
+            'arch_const': arch_const,
+            'imp_def_const': imp_def_const,
+            'evs': args.evs,
+            'fill_zeroes': args.fill_zeroes,
+            'nb_clus': args.nb_cluster,
+            'nb_cpu': args.nb_cpu,
+            'popeye_path': popeye_path,
+            'stdout_addr': fastsim_options["stdout_addr"],
+            'mte_default_tag': fastsim_options["mte_default_tag"],
+            'broadcastmte': fastsim_options["broadcastmte"],
+            'broadcastatomic': fastsim_options["broadcastatomic"],
+            'utb_trace_base_addr': fastsim_options["utb_trace_base_addr"],
+            'pmsa_memory_regions': fastsim_options["pmsa_memory_regions"],
+            'llram_base': fastsim_options["llram_base"],
+            'llram_size': fastsim_options["llram_size"],
+            'llram_shared': fastsim_options["llram_shared"],
+            'rvbar': fastsim_options["rvbar"],
+            'legacy_tz_en': fastsim_options["legacy_tz_en"],
+            'threads_per_cpu': args.threads_per_cpu,
+            'treat_wfi_wfe_as_nop': wfi_is_nop,
+    }
+
+    if os.path.exists(args.manifest):
+        manifest_path = args.manifest
+    else:
+        manifest_path = fetch_manifest_to_dir(revision=args.manifest,
+                                              path_in_repo=f'nahpc2/{args.project_run}',
+                                              output_dir=os.path.join(genasm_mp_path, 'manifests'))
+    components_revisions = get_component_revisions_from_manifest(manifest_path, vars(args))
+    assert are_manifest_components_available(components_revisions), "Some fastsim components are missing"
+
+    fastsim_params.update(components_revisions)
+
+    elf_files = get_test_elfs()
+
+    fastsim_params['elf_secure'] = elf_files.get(SecuritySpace.S)
+    fastsim_params['elf_non_secure'] = elf_files.get(SecuritySpace.NS)
+    fastsim_params['elf_root'] = elf_files.get(SecuritySpace.ROOT)
+    fastsim_params['elf_realm'] = elf_files.get(SecuritySpace.REALM)
+
+    def hard_link_file(source):
+        target = pathlib.Path(source.name)
+        target.unlink(missing_ok=True)
+        source.link_to(target)
+
+    popeye_include = pathlib.Path(popeye_path) / "include"
+    if elf_files.get(SecuritySpace.NS):
+        hard_link_file(popeye_include / "load_file_s")
+        hard_link_file(popeye_include / "load_file_ns")
+    if arch_const.FEAT_RME:
+        hard_link_file(popeye_include / "load_file_root")
+        hard_link_file(popeye_include / "load_file_realm")
+
+
+    fastsim_config = fastsim_cfg_factory(args.project_run, fastsim_params)
+    results["fastsim_revision"] = re.search(r"/(\d+)/", fastsim_config.cpu_model_path).group(1)
+
+    lib_path = os.pathsep.join(("/arm/tools/gnu/gcc/9.3.0/rhe6-x86_64/lib64/", os.environ.get("LD_LIBRARY_PATH", "")))
+
+    # This must be an exported env variable or it's not read
+    if fastsim_config.fastsim_singleton_registry is not None:
+        os.environ["FASTSIM_SINGLETON_REGISTRY"] = fastsim_config.fastsim_singleton_registry
+
+    command_str_l = ["LD_LIBRARY_PATH={0:s}".format(lib_path),
+                     " ".join(shlex.quote(arg) for arg in fastsim_config.get_fastsim_arg_l())]
+
+    command_str = " ".join(command_str_l)
+    LOGGER.info(command_str)
+
+    run_file = "fastsim.sh"
+    with open(run_file, "w") as run_fd:
+        run_fd.write("#!/bin/sh\n")
+        run_fd.write(command_str)
+
+    # Make command script executable
+    run_file_stat = os.stat(run_file)
+    os.chmod(run_file, run_file_stat.st_mode | stat.S_IEXEC)
+
+    try:
+        maxruntime = args.maxruntime if args.maxruntime is not None else 10
+        signal.alarm(maxruntime * 60) # Fires in maxruntime minutes, to prevent deadlocks
+
+        results["fastsim_undecided"] = True
+
+        procid = subprocess.Popen(fastsim_config.get_fastsim_arg_l(),
+                                  env=dict(os.environ, LD_LIBRARY_PATH=lib_path, UNIVENT_DISASS="rosetta"),
+                                  text=True,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT)
+        results["fastsim_started"] = True
+        results.dump()
+
+        with open("fastsim.log", "w") as log_fd:
+            for l in ProcessReader(procid.stdout):
+                log_fd.write(l)
+                log_fd.write("\n")
+                LOGGER.info(l)
+
+                if "** TEST PASSED OK **" in l:
+                    results["fastsim_passed"] = True
+                    results["fastsim_undecided"] = False
+                if "** TEST FAILED **" in l:
+                    results["fastsim_failed"] = True
+                if "(failure" in l:
+                    msg = l.split("(failure")[1].strip(" ()\n\r\t")
+                    results["fastsim_failure"] = msg if msg else True
+
+                if "Iter" in l:
+                    match = re.search(r"Iter (\d+)", l)
+                    iteration = int(match.group(1))
+                    results["fastsim_last_iteration"] = iteration
+
+                assert_match = re.search(r"Assertion (.*) failed", l)
+                if assert_match:
+                    results["fastsim_internal_error"] = assert_match.group(0)
+                if "SIGSEGV" in l:
+                    results["fastsim_internal_error"] = l.strip()
+                if "Fatal Error: CADIExecContinue(..) returned error." in l:
+                    results["fastsim_internal_error"] = l.strip()
+
+        if results.get("fastsim_failure"):
+            last_iteration = results.get("fastsim_last_iteration")
+            if last_iteration:
+                results["fastsim_failure"] += f" (on iteration {last_iteration})"
+
+        results["fastsim_done"] = True
+
+    except TimeoutException:
+        procid.terminate()
+        if "fastsim_last_iteration" in results:
+            results["fastsim_timeout_started"] = True
+        else:
+            results["fastsim_timeout_not_started"] = True
+        raise
+
+    except InterruptException:
+        procid.terminate()
+        results["fastsim_interrupted"] = True
+        raise
+
+    except LSFTimeoutException:
+        procid.terminate()
+        results["fastsim_lsf_timeout"] = True
+        raise
+
+    except LSFMemoryException:
+        procid.terminate()
+        results["fastsim_lsf_memory"] = True
+        raise
+
+    except LSFFileException:
+        procid.terminate()
+        results["fastsim_lsf_file"] = True
+        raise
+
+    except Exception as ex:
+        procid.terminate()
+        results["fastsim_exception"] = exception_to_str(ex)
+        raise
+
+    finally:
+        signal.alarm(0)
+
+        if procid.wait() and not (
+                results.get("fastsim_timeout_started")
+                or results.get("fastsim_timeout_not_started")
+                or results.get("fastsim_interrupted")
+                or results.get("fastsim_lsf_timeout")
+                or results.get("fastsim_lsf_memory")
+                or results.get("fastsim_lsf_file")
+                or results.get("fastsim_exception")
+                or results.get("fastsim_passed")
+                or results.get("fastsim_failed")
+                or results.get("fastsim_internal_error")
+        ):
+            returncode_str = decode_returncode(procid.returncode)
+            LOGGER.warning("Fastsim return code was %s", returncode_str)
+            results["fastsim_returncode"] = returncode_str
+        else:
+            LOGGER.info("Fastsim simulation finished")
+
+    if (results.get("fastsim_failed")
+                or results.get("fastsim_failure")
+                or results.get("fastsim_internal_error")
+                or results.get("fastsim_returncode")
+       ):
+        results["fastsim_undecided"] = False
+        raise FailureException
+
+    if procid.returncode:
+        raise ReturnCodeException
+
+    if results.get("fastsim_undecided"):
+        raise UndecidedException
+
+def acme_a_test(maxruntime, acme_cpu, tarmac):
+    LOGGER.info("""
+------------------------------------------------------
+------  SIMULATE GENERATED TEST WITH ACME      ----
+------------------------------------------------------""")
+
+    acme_path = os.environ.get("ACME_PATH")
+    if acme_path is None:
+        raise ValueError("ACME_PATH env variable is not set! Cannot find ACME binary!")
+    if acme_cpu == "":
+        raise ValueError("ACME config file is not set! Cannot launch ACME!")
+
+    elf_files = get_test_elfs(only_secure=True)
+
+    acme_arg_l = [acme_path + "/build/acme",
+                  acme_path + "/configs/" + acme_cpu + ".config",
+                  "-Vs", elf_files[SecuritySpace.S], "-r"]
+
+    if tarmac:
+        acme_arg_l += ["--tarmac-file=acme.tarmac.log", "--tarmac-mapfile=test.map"]
+
+    lib_path = os.pathsep.join(("/arm/tools/gnu/gcc/8.2.0/rhe7-x86_64/lib64", os.environ.get("LD_LIBRARY_PATH", "")))
+
+    LOGGER.info(" ".join(acme_arg_l))
+
+    try:
+        maxruntime = maxruntime if maxruntime is not None else 20
+        signal.alarm(maxruntime * 60) # Fires in maxruntime minutes, to prevent deadlock
+
+        results["acme_undecided"] = True
+
+        procid = subprocess.Popen(acme_arg_l,
+                                  env=dict(os.environ, LD_LIBRARY_PATH=lib_path),
+                                  text=True,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT)
+        results["acme_started"] = True
+        results.dump()
+
+        with open("acme.log", "w") as log_fd:
+            for l in ProcessReader(procid.stdout):
+                log_fd.write(l)
+                log_fd.write("\n")
+                LOGGER.info(l)
+
+                if "** TEST PASSED OK **" in l:
+                    results["acme_passed"] = True
+                    results["acme_undecided"] = False
+                if "** TEST FAILED **" in l:
+                    results["acme_failed"] = True
+                if "(failure" in l:
+                    msg = l.split("(failure")[1].strip(" ()\n\r\t")
+                    results["acme_failure"] = msg if msg else True
+
+        results["acme_done"] = True
+
+    except TimeoutException:
+        procid.terminate()
+        results["acme_timeout"] = True
+        raise
+
+    except InterruptException:
+        procid.terminate()
+        results["acme_interrupted"] = True
+        raise
+
+    except LSFTimeoutException:
+        procid.terminate()
+        results["acme_lsf_timeout"] = True
+        raise
+
+    except LSFMemoryException:
+        procid.terminate()
+        results["acme_lsf_memory"] = True
+        raise
+
+    except LSFFileException:
+        procid.terminate()
+        results["acme_lsf_file"] = True
+        raise
+
+    except Exception as ex:
+        procid.terminate()
+        results["acme_exception"] = exception_to_str(ex)
+        raise
+
+    finally:
+        signal.alarm(0)
+
+        if procid.wait() and not (
+                results.get("acme_timeout")
+                or results.get("acme_interrupted")
+                or results.get("acme_lsf_timeout")
+                or results.get("acme_lsf_memory")
+                or results.get("acme_lsf_file")
+                or results.get("acme_exception")
+                or results.get("acme_passed")
+                or results.get("acme_failed")
+        ):
+            returncode_str = decode_returncode(procid.returncode)
+            LOGGER.warning("acme return code was %s", returncode_str)
+            results["acme_returncode"] = returncode_str
+        else:
+            LOGGER.info("acme simulation finished")
+
+    if results.get("acme_failed") or results.get("acme_failure"):
+        results["acme_undecided"] = False
+        raise FailureException
+
+    if procid.returncode:
+        raise ReturnCodeException
+
+    if results.get("acme_undecided"):
+        raise UndecidedException
+
+def fpga_a_test(popeye_path,
+                maxruntime,
+                fpga_hex,
+                fpga_revision,
+                fpga_board,
+                fpga_image,
+                fpga_options,
+                project):
+    LOGGER.info("""
+------------------------------------------------------
+------  SIMULATE GENERATED TEST ON FPGA           ----
+------------------------------------------------------""")
+    assert fpga_board is not None, "Need to specify a FPGA board to run on"
+    assert fpga_image is not None, "Need to specify a FPGA image to use"
+
+    elf_files = get_test_elfs(only_secure=True)
+    elf_path = elf_files[SecuritySpace.S]
+
+    if fpga_hex:
+        boot_path, body_path = split_elf_in_hexes(elf_path)
+        payload_arg_l = ["--prepayload", boot_path, "--prepayload", body_path]
+    else:
+        payload_arg_l = ["--prepayload", elf_path]
+
+    fpgabin, _ = last_but_not_least("/arm/tools/automation/farm_toolkit/*/linux-x86_64/bin", fpga_revision)
+
+    fpga_arg_l = [os.path.join(fpgabin, "fpga-run"),
+                  "--board", fpga_board,
+                  "--image", fpga_image,
+                  "--project", project,
+                  "--payloadconfig", "@automation_genasm.conf",
+                  "--config", os.path.join(popeye_path, "tools", "fpga", "payload_genasm.cfg"),
+                  "--noverifypayloads",
+                  "--wait"]
+
+    fpga_arg_l += payload_arg_l
+
+    fpga_arg_l += [f"--{option}" for option in fpga_options]
+
+    command_str_l = ["FPGABIN={0:s}".format(fpgabin),
+                     " ".join(shlex.quote(arg) for arg in fpga_arg_l)]
+    LOGGER.info(" ".join(command_str_l))
+
+    time_start = time_run_start = time.time()
+
+    try:
+        maxruntime = maxruntime if maxruntime is not None else 20
+        signal.alarm(maxruntime * 60) # Fires in maxruntime minutes, to prevent deadlock
+
+        results["fpga_undecided"] = True
+
+        procid = subprocess.Popen(fpga_arg_l,
+                                  env=dict(os.environ, FPGABIN=fpgabin),
+                                  text=True,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT)
+        results["fpga_started"] = True
+        results.dump()
+
+        agent_cpu_cycles = []
+        agent_cpu_instructions = []
+        event_cov_l = []
+
+        skip_parse = True
+
+        with open("fpga.log", "w") as log_fd:
+            for l in ProcessReader(procid.stdout):
+                log_fd.write(l)
+                log_fd.write("\n")
+                LOGGER.info(l)
+
+                if "Beginning Run" in l:
+                    skip_parse = False
+                    time_run_start = time.time()
+
+                if skip_parse:
+                    continue
+
+                if "** TEST PASSED OK **" in l:
+                    results["fpga_passed"] = True
+                    results["fpga_undecided"] = False
+                if "** TEST FAILED **" in l:
+                    results["fpga_failed"] = True
+                if "(failure" in l:
+                    msg = l.split("(failure")[1].strip(" ()\n\r\t")
+                    results["fpga_failure"] = msg if msg else True
+
+                if "uart output timeout" in l:
+                    results["fpga_uart_timeout"] = True
+                elif "SVA failure detected" in l:
+                    results["fpga_sva_failure"] = True
+                elif "Upload duration:" in l:
+                    match = re.search(r"Upload duration: (\d+)", l)
+                    seconds = int(match.group(1))
+                    results["fpga_upload_time"] = seconds
+                elif "Iter" in l:
+                    match = re.search(r"Iter (\d+)", l)
+                    iteration = int(match.group(1))
+                    results["fpga_last_iteration"] = iteration
+                elif "last iteration:" in l:
+                    match = re.search(r"last iteration: (\d+)", l)
+                    iteration = int(match.group(1))
+                    results["fpga_last_iteration"] = iteration
+                elif "kcycles:" in l:
+                    match = re.search(r"kcycles: (\d+)", l)
+                    cycles = int(match.group(1)) * 1024
+                    agent_cpu_cycles.append(cycles)
+                elif "instructions:" in l:
+                    match = re.search(r"instructions: (\d+)", l)
+                    instrs = int(match.group(1))
+                    agent_cpu_instructions.append(instrs)
+                elif "CNTPCT_failure" in l:
+                    match = re.search(r"CNTPCT_failure: (0x[0-9a-fA-F]+)", l)
+                    cntpct_failure = int(match.group(1), 16)
+                    results["fpga_cntpct_failure"] = cntpct_failure
+                elif "PMU_CVG_GSV" in l:
+                    match = re.search(r"(\[PMU_CVG_GSV\].*$)", l)
+                    event_cov_l.append(match.group(1))
+
+        if agent_cpu_cycles:
+            results["fpga_cpu_cycles"] = sum(agent_cpu_cycles) // len(agent_cpu_cycles)
+        if agent_cpu_instructions:
+            results["fpga_cpu_instructions"] = sum(agent_cpu_instructions) // len(agent_cpu_instructions)
+        if event_cov_l:
+            with open("fpga.events.txt", "w") as event_cov_fd:
+                for line in event_cov_l:
+                    event_cov_fd.write(line)
+                    event_cov_fd.write("\n")
+
+        if results.get("fpga_failure"):
+            last_iteration = results.get("fpga_last_iteration")
+            if last_iteration:
+                results["fpga_failure"] += f" (on iteration {last_iteration})"
+
+        results["fpga_done"] = True
+
+    except (TimeoutException, LSFTimeoutException):
+        procid.terminate()
+        if "fpga_last_iteration" in results:
+            results["fpga_timeout_started"] = True
+        else:
+            results["fpga_timeout_not_started"] = True
+        raise
+
+    except InterruptException:
+        procid.terminate()
+        results["fpga_interrupted"] = True
+        raise
+
+    except Exception as ex:
+        procid.terminate()
+        results["fpga_exception"] = exception_to_str(ex)
+        raise
+
+    finally:
+        signal.alarm(0)
+
+        time_end = time.time()
+        results["fpga_total_time"] = time_end - time_start
+        results["fpga_run_time"] = time_end - time_run_start
+
+        if procid.wait() and not (
+                results.get("fpga_timeout_started")
+                or results.get("fpga_timeout_not_started")
+                or results.get("fpga_interrupted")
+                or results.get("fpga_exception")
+                or results.get("fpga_passed")
+                or results.get("fpga_failed")
+        ):
+            returncode_str = decode_returncode(procid.returncode)
+            LOGGER.warning("FPGA return code was %s", returncode_str)
+            results["fpga_returncode"] = returncode_str
+        else:
+            LOGGER.info("FPGA simulation finished")
+
+    if results.get("fpga_failed") or \
+       results.get("fpga_sva_failure") or \
+       results.get("fpga_failure"):
+        results["fpga_undecided"] = False
+        raise FailureException
+
+    if procid.returncode:
+        raise ReturnCodeException
+
+    if results.get("fpga_undecided"):
+        raise UndecidedException
+
+def minitb_a_test(args,
+                  fill_zeroes,
+                  short_test_name,
+                  minitb_simbuild,
+                  nb_cpu_c,
+                  simulator,
+                  project,
+                  genasm_mp_path):
+    LOGGER.info("""
+------------------------------------------------------
+----      SIMULATE GENERATED TEST WITH MINITB      ---
+------------------------------------------------------""")
+    try:
+        # REVISIT(arnbar01, GENMP, set to default values when mini_tb will be able to manage mutli CPUs)
+        # assert 1 <= nb_cpu_c <= 8, "illegal number of CPUs"
+        assert nb_cpu_c == 1, "illegal number of CPUs"
+        assert project == "makalu", "mini_tb support only Makalu"
+
+        # MiniTB not yet handles other init values
+        fill_zeroes = True
+
+        valrundir = os.path.join(genasm_mp_path, "minitb")
+        assert os.path.exists(valrundir), \
+                "we now would like to run the command above, but could not find the correct run directory in '${}'.\n" \
+                "did you maybe forget to create the proper environment. Try \"genasm_mp --resetenv --minitb_dir path/to/minitb\"".format(valrundir)
+
+        rtldir = os.path.join(valrundir, "../../")
+        assert os.path.exists(rtldir), "did not find the RTL directory " + rtldir
+
+        _, rtl_git_sha1, rtl_git_desc = get_git_environment(rtldir)
+
+        LOGGER.info("RTL_GIT_SHA1: %s", rtl_git_sha1)
+        results["rtl_git_sha1"] = rtl_git_sha1
+        LOGGER.info("RTL_GIT_DESCRIBE: %s", rtl_git_desc)
+        results["rtl_git_desc"] = rtl_git_desc
+
+    except AssertionError as ex:
+        results["validation_exception"] = exception_to_str(ex)
+        raise
+
+    tb_seed = args.tb_seed if args.tb_seed else args.seed & ((1 << 32) - 1)
+    simbuild_list = []
+    sconfig_list = list(args.minitb_sconfig)
+    simopts_list = list(args.simopts)
+
+    elf_files = get_test_elfs(only_secure=True)
+    elf_path = os.path.join(genasm_mp_path, "tests", short_test_name, elf_files[SecuritySpace.S])
+
+    simbuild_list.append("mkl_mp{0:d}".format(nb_cpu_c))
+
+    if minitb_simbuild:
+        for simbuild_elem in minitb_simbuild:
+            simbuild_list += [
+                    simbuild_elem,
+            ]
+    else:
+        simbuild_list += [
+                "nocrypto",
+        ]
+    simbuild_list += [
+            "ota",
+    ]
+    sconfig_list += [
+            "genasm_mp",
+            "{0:d}cpus".format(nb_cpu_c),
+    ]
+    simopts_list += [
+            "+tbench_no_rresp_rand",
+            "+ota",
+    ]
+
+    if args.isscmp:
+        sconfig_list += ["isscmp_no_init" if fill_zeroes else "isscmp", "isscmp_dbg", "no_stop_error"]
+
+    # in minitb test_name.ELF must be happened just after -bin
+    validation_arg_l = ["validation", "-bin", elf_path]
+
+    sconfig_list.append("a64") # in minitb tells the elf2mem tool to use
+
+    if args.dcc:
+        sconfig_list.append("dcc")
+        validation_arg_l += ["-ifiles", "dcc_exclusions.json"]
+        sconfig_list.append("log_mmu")
+
+    validation_arg_l += [
+            #"-timeout", str(timeout), timeout switch does not work?
+            "-v",
+            "-{}".format(simulator)
+    ]
+
+    if args.fsdb:
+        validation_arg_l += ["-fsdb", "-sigstart", "0"]
+
+    if args.tarmac:
+        validation_arg_l += ["-eis"]
+
+    if args.build_rtl:
+        validation_arg_l += ["-build"]
+        results["build_rtl"] = True
+
+    simopts_list += [
+            # For easiest reproductability of regression jobs on local machine, by default we use
+            # the generation seed as tb_seed in validation, unless a specific tb_seed is provided by the user
+            "+tb_seed={0:d}".format(tb_seed),
+            "+sv_seed={0:d}".format(tb_seed),
+            "+tbench_check_uninitialized_access=0",
+            "+tbench_uninitialized_data=0x{0:x}".format(0 if fill_zeroes else 0xffa7beecffa7beecffa7beecffa7beec),
+            "+arch64",
+    ]
+
+    if args.maxruncycles:
+        simopts_list += ["+watchdog_timeout={0:d}".format(args.maxruncycles)]
+
+    if args.logmem:
+        simopts_list += ["+tbench_mem_verbosity=2"]
+
+    if simbuild_list:
+        validation_arg_l += ["-simbuild", ".".join(simbuild_list)]
+
+    if sconfig_list:
+        validation_arg_l += ["-sconfig", ".".join(sconfig_list)]
+
+    if simopts_list:
+        for elem in simopts_list:
+            validation_arg_l += ["-simopts", elem]
+
+
+    LOGGER.info(" ".join(validation_arg_l))
+
+    try:
+        maxruntime = args.maxruntime if args.maxruntime is not None else 12 * 60
+        signal.alarm(maxruntime * 60) # Fires in maxruntime minutes, to prevent deadlock
+
+        results["validation_undecided"] = True
+
+        procid = subprocess.Popen('bash -c "source dotshrc && ' + ' '.join(validation_arg_l) + '"',
+                                  cwd=valrundir,
+                                  text=True,
+                                  shell=True,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT)
+        results["validation_started"] = True
+        results.dump()
+
+        lint_part = False
+        validation_sim_tb_cycles = validation_sim_cpu_cycles = validation_sim_time = None
+        with open("validation.log", "w") as log_fd:
+            for l in ProcessReader(procid.stdout):
+                log_fd.write(l)
+                log_fd.write("\n")
+                LOGGER.info(l)
+
+                if "Lint" in l:
+                    lint_part = True
+                elif l == "\n":
+                    lint_part = False
+
+                if "** TEST PASSED OK **" in l:
+                    results["validation_undecided"] = False
+                    results["validation_passed"] = True
+                if "** TEST FAILED **" in l:
+                    results["validation_failed"] = True
+                if "(failure" in l:
+                    msg = l.split("(failure")[1].strip(" ()\n\r\t")
+                    results["validation_failure"] = msg if msg else True
+                # TODO(ericha01, GENMP, mutualize test length stats  for all platform and automate detection like for failure)
+                if "File name too long" in l:
+                    results["validation_filename_toolong"] = True
+                if "test too long" in l:
+                    results["validation_toolong"] = True
+                if "test way too long" in l:
+                    results["validation_waytoolong"] = True
+                if "test too short" in l:
+                    results["validation_tooshort"] = True
+                if "WFx timer delay too small" in l:
+                    results["validation_wfi_timer_small"] = True
+                if "DCC PASS" in l and not results.get("dcc_fail", False):
+                    results["dcc_pass"] = True
+                if "DCC FAIL" in l:
+                    results["dcc_fail"] = True
+                    results["dcc_pass"] = False
+                if "DCC UNKNOWN" in l:
+                    results["dcc_unknown"] = True
+                if "MISMATCH" in l:
+                    results["isscmp_mismatch"] = True
+                if "Concurrent live trackers limit reached" in l:
+                    results["univent_trackerlimit"] = True
+                if "OVL_FATAL" in l and \
+                        "The text macro 'OVL_FATAL' has also been defined" not in l and \
+                        not ("+define" in l and "+OVL_FATAL" in l):
+                    results["ovl_fatal"] = " : ".join(s.strip() for s in l.split(":")[2:])
+                if "UVM_FATAL" in l and \
+                        re.match(r"# Number of caught UVM_FATAL reports\s+:\s+\b0\b", l) is None and \
+                        re.match(r"# Number of demoted UVM_FATAL reports\s+:\s+\b0\b", l) is None and \
+                        re.match(r"# UVM_FATAL\s+:\s+\b0\b", l) is None:
+                    results["uvm_fatal"] = True
+                if "UVM_ERROR" in l and \
+                        re.match(r"# Number of caught UVM_ERROR reports\s+:\s+\b0\b", l) is None and \
+                        re.match(r"# Number of demoted UVM_ERROR reports\s+:\s+\b0\b", l) is None and \
+                        re.match(r"# UVM_ERROR\s+:\s+\b0\b", l) is None:
+                    results["uvm_error"] = True
+                if "dut_fatal" in l:
+                    results["dut_fatal"] = True
+                if "Errors: " in l and "Errors: 0" not in l:
+                    results["validation_errors"] = l
+                if "CHI5PC_ERR" in l and not ("CHI5PC_ERR_DAT_DATA_DVM" in l and "sformatf" in l):
+                    results["chi5_error"] = True
+                if "ACE_ERRM" in l and not lint_part:
+                    results["ace_error"] = True
+                if "AXI4_ERR" in l and not lint_part:
+                    results["axi4_error"] = True
+                if "Fatal" in l:
+                    results["validation_fatal"] = " : ".join(s.strip() for s in l.split(":")[1:])
+                if "WDOG TIME OUT" in l or "WATCHDOG" in l:
+                    results["wdog_timeout"] = True
+                if "Post command failed" in l:
+                    results["validation_post_fail"] = True
+                if "validation: sim real time: " in l:
+                    results["validation_sim_time"] = validation_sim_time = float(l.strip().split(" ")[-1])
+                if "kcycles: " in l:
+                    results["validation_sim_cpu_cycles"] = \
+                    validation_sim_cpu_cycles = \
+                    results.get("validation_sim_cpu_cycles", 0) + float(l.strip().split(" ")[-1]) * 1024
+                if l.startswith("#    Time:") or l.startswith("Simulation stopped via") or l.startswith("$stop at time"):
+                    m = re.search(r"(\d+) ([munp]s)", l.lower())
+                    assert m, "found \"Time\" in line, but could not extract runtime"
+                    end_cycle_time = int(m.group(1))
+                    time_unit = m.group(2)
+                    end_cycle_time = int(end_cycle_time * {"ps": 0.001, "ns": 1, "us": 1000, "ms": 1000000}[time_unit])
+                    clk_period = 10 # may be customized by project
+                    results["validation_sim_tb_cycles"] = validation_sim_tb_cycles = end_cycle_time // clk_period
+
+                if "Seen SIGUSR2" in l or "Seen SIGINT" in l:
+                    # this should never happen, since we catch SIGUSR2 and SIGINT ourself
+                    raise Exception
+
+        if validation_sim_cpu_cycles and validation_sim_time:
+            results["validation_sim_cpu_rate"] = validation_sim_cpu_cycles // validation_sim_time // nb_cpu_c
+        if validation_sim_tb_cycles and validation_sim_time:
+            results["validation_sim_tb_rate"] = validation_sim_tb_cycles // validation_sim_time
+        results["validation_done"] = True
+
+    except TimeoutException:
+        procid.terminate()
+        results["validation_timeout"] = True
+        raise
+
+    except InterruptException:
+        procid.terminate()
+        results["validation_interrupted"] = True
+        raise
+
+    except LSFTimeoutException:
+        procid.terminate()
+        results["validation_lsf_timeout"] = True
+        raise
+
+    except LSFMemoryException:
+        procid.terminate()
+        results["validation_lsf_memory"] = True
+        raise
+
+    except LSFFileException:
+        procid.terminate()
+        results["validation_lsf_file"] = True
+        raise
+
+    except Exception as ex:
+        procid.terminate()
+        results["validation_exception"] = exception_to_str(ex)
+        raise
+
+    finally:
+        signal.alarm(0)
+
+        if procid.wait() and not (
+                results.get("validation_timeout")
+                or results.get("validation_interrupted")
+                or results.get("validation_lsf_timeout")
+                or results.get("validation_lsf_memory")
+                or results.get("validation_lsf_file")
+                or results.get("validation_exception")
+                or results.get("validation_passed")
+                or results.get("validation_failed")
+        ):
+            returncode_str = decode_returncode(procid.returncode)
+            LOGGER.warning("Validation return code was %s", returncode_str)
+            results["validation_returncode"] = returncode_str
+        else:
+            LOGGER.info("Validation finished")
+
+    if results.get("validation_failed") or \
+       results.get("validation_failure") or \
+       results.get("validation_filename_toolong") or \
+       results.get("dcc_unknown") or \
+       results.get("dcc_fail") or \
+       results.get("isscmp_mismatch") or \
+       results.get("univent_trackerlimit") or \
+       results.get("ovl_fatal") or \
+       results.get("uvm_fatal") or \
+       results.get("dut_fatal") or \
+       results.get("ace_error") or \
+       results.get("axi4_error") or \
+       results.get("validation_fatal") or \
+       results.get("wdog_timeout") or \
+       results.get("validation_post_fail"):
+        results["validation_undecided"] = False
+        raise FailureException
+
+    if procid.returncode:
+        raise ReturnCodeException
+
+    if results.get("validation_undecided"):
+        raise UndecidedException
+
+def utb_blk_val_a_test(build_rtl,
+                       update_rtl,
+                       build_option,
+                       project,
+                       tb_seed,
+                       nb_cluster,
+                       nb_cpu,
+                       test_name,
+                       simulator,
+                       fsdb,
+                       fill_zeroes,
+                       dcc,
+                       max_run_cycles,
+                       max_run_time,
+                       log_mem,
+                       isscmp,
+                       simopts_l,
+                       popeye_path,
+                       genasm_mp_test_path):
+    LOGGER.info("""
+------------------------------------------------------
+----       SIMULATE GENERATED TEST WITH UTB       ----
+------------------------------------------------------""")
+
+    try:
+        utb_config = utb_cfg_factory(project)
+
+    except ValueError as ex:
+        results["internal_exception"] = exception_to_str(ex)
+        raise
+
+    tb_folder = os.path.join(popeye_path, "tb")
+    project_tb_folder = os.path.join(tb_folder, f"{project}_tb", project)
+    top_tb_folder = os.path.join(project_tb_folder, utb_config.top_tb_rel_folder)
+    cfg_file_path = os.path.join(top_tb_folder, 'tests', f"{test_name}.cfg")
+
+    is_tb_folder_present = os.path.exists(project_tb_folder)
+    build_rtl |= not is_tb_folder_present
+
+    try:
+        if build_rtl or update_rtl:
+            # Is the TB repo present?
+            if not is_tb_folder_present:
+                # No, clone it
+                LOGGER.info("Cloning the TB repository...")
+                if not os.path.exists(tb_folder):
+                    os.makedirs(tb_folder)
+
+                cmds = utb_config.get_clone_repo_cmd(project_tb_folder)
+                cwd = os.path.join(popeye_path, "tb")
+
+            elif update_rtl:
+                # Yes, update it
+                LOGGER.info("Updating the TB repository...")
+                cmds = utb_config.get_update_repo_cmd()
+                cwd = project_tb_folder
+
+            else:
+                cmds = []
+
+            if cmds:
+                proc = subprocess.Popen(cmds,
+                                        cwd=cwd,
+                                        text=True,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT)
+
+                ret_code = proc.wait()
+                if ret_code != 0:
+                    LOGGER.error("Unable to connect to the git repository")
+                    raise ReturnCodeException
+
+            if not is_tb_folder_present or update_rtl:
+                if utb_config.init_repo_cmds:
+                    # Download all the dependencies
+                    LOGGER.info("Initializing the TB environment...")
+                    proc = subprocess.Popen(utb_config.get_init_repo_cmd(),
+                                            cwd=project_tb_folder,
+                                            text=True,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT)
+                proc.wait()
+
+            # Compile the TB
+            blk_compile_cmd = utb_config.get_compile_cmd(build_option,
+                                                         nb_cluster,
+                                                         nb_cpu,
+                                                         fsdb,
+                                                         simulator)
+            LOGGER.info("Compiling the TB...: %s", ' '.join(blk_compile_cmd))
+            if build_option is not None:
+                build_suffix = f"{hashlib.sha1(build_option.encode('utf-8')).hexdigest()}"
+
+            else:
+                build_suffix = f"{nb_cluster}x{nb_cpu}_{simulator}"
+
+            build_log_file_name = f"build_{build_suffix}"
+            if fsdb:
+                build_log_file_name += "_fsdb"
+            build_log_file_name += ".log"
+            with open(os.path.join(project_tb_folder, build_log_file_name), "w") as build_log_file:
+                proc = subprocess.Popen(blk_compile_cmd,
+                                        cwd=project_tb_folder,
+                                        text=True,
+                                        stdout=build_log_file,
+                                        stderr=subprocess.STDOUT)
+                proc.wait()
+
+        else:
+            LOGGER.info("Skipping TB cloning and compilation...")
+
+    except AssertionError as ex:
+        results["blkval_exception"] = exception_to_str(ex)
+        raise
+
+    _, rtl_git_sha1, rtl_git_desc = get_git_environment(project_tb_folder)
+    LOGGER.info("RTL_GIT_SHA1: %s", rtl_git_sha1)
+    results["rtl_git_sha1"] = rtl_git_sha1
+    LOGGER.info("RTL_GIT_DESCRIBE: %s", rtl_git_desc)
+    results["rtl_git_desc"] = rtl_git_desc
+
+    # Prepare the cfg file for blk_val
+    elf_files = get_test_elfs()
+    for security_space, elf_file in elf_files.items():
+        elf_files[security_space] = os.path.join(genasm_mp_test_path, "tests", test_name, elf_file)
+    dcc_exclusions_path = None if not dcc else os.path.join(genasm_mp_test_path, "tests", test_name, "dcc_exclusions.utb")
+    mte_init_path = os.path.join(genasm_mp_test_path, "tests", test_name, "mte_init.utb")
+    if not os.path.exists(mte_init_path):
+        mte_init_path = None
+    simopts_list = simopts_l + utb_config.get_plus_args(tb_seed,
+                                                        fill_zeroes,
+                                                        mte_init_path,
+                                                        dcc_exclusions_path,
+                                                        elf_files,
+                                                        max_run_cycles,
+                                                        log_mem,
+                                                        isscmp)
+
+    with open(cfg_file_path, "w") as cfg_file:
+        cfg_file.write("# This will define uvm_testname for this simulation\n")
+        cfg_file.write(f"test_name          = \"{test_name}\"\n")
+
+        if simopts_list:
+            cfg_file.write("\n# This will add the following plus args to the command line\n")
+
+            first_sim_opt_l = simopts_list[0].split("=", 2)
+            cfg_file.write(f'plusargs_d.update({{\"{first_sim_opt_l[0]}\":')
+            if len(first_sim_opt_l) == 2:
+                cfg_file.write(f" \"{first_sim_opt_l[1]}\"")
+            else:
+                cfg_file.write(" None")
+            cfg_file.write(",\n")
+
+            for sim_opt in simopts_list[1:]:
+                sim_opt_l = sim_opt.split("=", 2)
+                cfg_file.write(f'                   "{sim_opt_l[0]}":')
+                if len(sim_opt_l) == 2:
+                    cfg_file.write(f" \"{sim_opt_l[1]}\"")
+                else:
+                    cfg_file.write(" None")
+                cfg_file.write(",\n")
+
+            cfg_file.write('                  })\n')
+
+    blk_val_cmd = utb_config.get_run_cmd(test_name,
+                                         build_option,
+                                         nb_cluster,
+                                         nb_cpu,
+                                         fsdb,
+                                         simulator,
+                                         top_tb_folder,
+                                         genasm_mp_test_path)
+
+    blk_val_env = os.environ.copy()
+    blk_val_env.update({
+            f"{project.upper()}_TARMAC_MAPFILENAME": os.path.join(genasm_mp_test_path, "tests", test_name, "test.map"),
+            f"{project.upper()}_TARMAC_FILENAME": "tarmac.@PATH@.log",
+            "VALIDATION_TMPDIR": os.path.join(genasm_mp_test_path, "tests", test_name)
+    })
+
+    try:
+        max_run_time = max_run_time if max_run_time is not None else 24 * 60  # 24h ought to be enough for anybody
+        signal.alarm(max_run_time * 60)
+
+        results["blkval_undecided"] = True
+
+        LOGGER.info("Running on the TB: %s", ' '.join(blk_val_cmd))
+        procid = subprocess.Popen(blk_val_cmd,
+                                  cwd=project_tb_folder,
+                                  env=blk_val_env,
+                                  text=True,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT)
+
+        results["blkval_started"] = True
+        results.dump()
+
+        blkval_sim_tb_cycles = blkval_sim_cpu_cycles = blkval_sim_time = None
+        tube_filter = re.compile(r".*# UVM_INFO @ \d+ ns: uvm_test_top\.top_tb_env\.utb_env\.tube \[TUBE\]\s+\d+ ns\|\s+\d+ ns\|")
+        for line in ProcessReader(procid.stdout):
+            tube_output = tube_filter.sub("", line)
+            if tube_output != line:
+                LOGGER.info("TUBE %s", tube_output)
+
+            if "** TEST PASSED OK **" in line:
+                results["blkval_undecided"] = False
+                results["blkval_passed"] = True
+            if "** TEST FAILED **" in line:
+                results["blkval_failed"] = True
+            if "(failure" in line:
+                msg = line.split("(failure")[1].strip(" ()\n\r\t")
+                results["blkval_failure"] = msg if msg else True
+            if "ISSCMP: cmp: | MISMATCH" in line:
+                results["isscmp_mismatch"] = True
+            if "UVM_FATAL" in line and \
+                    re.match(r".*# Number of caught UVM_FATAL reports\s+:\s+\b0\b", line) is None and \
+                    re.match(r".*# Number of demoted UVM_FATAL reports\s+:\s+\b0\b", line) is None and \
+                    re.match(r".*# UVM_FATAL\s+:\s+\b0\b", line) is None:
+                results["uvm_fatal"] = True
+            if "UVM_ERROR" in line and \
+                    re.match(r".*# Number of caught UVM_ERROR reports\s+:\s+\b0\b", line) is None and \
+                    re.match(r".*# Number of demoted UVM_ERROR reports\s+:\s+\b0\b", line) is None and \
+                    re.match(r".*# UVM_ERROR\s+:\s+\b0\b", line) is None:
+                results["uvm_error"] = True
+            if "sim: cpu time " in line:
+                results["blkval_sim_time"] = blkval_sim_time = float(line.strip().split(" ")[-2])
+            if "kcycles: " in line:
+                results["blkval_sim_cpu_cycles"] = \
+                blkval_sim_cpu_cycles = \
+                results.get("blkval_sim_cpu_cycles", 0) + float(line.strip().split(" ")[-1]) * 1024
+            if re.match(r".*#    Time:", line) or re.match(r".*Simulation stopped via", line) or re.match(r".*$stop at time", line):
+                m = re.search(r"(\d+) ([munp]s)", line.lower())
+                assert m, "found \"Time\" in line, but could not extract runtime"
+                end_cycle_time = int(m.group(1))
+                time_unit = m.group(2)
+                end_cycle_time = int(end_cycle_time * {"ps": 0.001, "ns": 1, "us": 1000, "ms": 1000000}[time_unit])
+                clk_period = 10 # may be customized by project
+                results["blkval_sim_tb_cycles"] = blkval_sim_tb_cycles = end_cycle_time // clk_period
+
+        if blkval_sim_cpu_cycles and blkval_sim_time:
+            results["blkval_sim_cpu_rate"] = blkval_sim_cpu_cycles // blkval_sim_time // nb_cpu
+        if blkval_sim_tb_cycles and blkval_sim_time:
+            results["blkval_sim_tb_rate"] = blkval_sim_tb_cycles // blkval_sim_time
+        results["blkval_done"] = True
+
+    except TimeoutException:
+        procid.terminate()
+        results["blkval_timeout"] = True
+        raise
+
+    except InterruptException:
+        procid.terminate()
+        results["blkval_interrupted"] = True
+        raise
+
+    except LSFTimeoutException:
+        procid.terminate()
+        results["blkval_lsf_timeout"] = True
+        raise
+
+    except LSFMemoryException:
+        procid.terminate()
+        results["blkval_lsf_memory"] = True
+        raise
+
+    except LSFFileException:
+        procid.terminate()
+        results["blkval_lsf_file"] = True
+        raise
+
+    except Exception as ex:
+        procid.terminate()
+        results["blkval_exception"] = exception_to_str(ex)
+        raise
+
+    finally:
+        signal.alarm(0)
+
+        try:
+            os.remove(cfg_file_path)
+        except OSError:
+            pass
+
+        if procid.wait() and not (
+                results.get("blkval_timeout")
+                or results.get("blkval_interrupted")
+                or results.get("blkval_lsf_timeout")
+                or results.get("blkval_lsf_memory")
+                or results.get("blkval_lsf_file")
+                or results.get("blkval_exception")
+                or results.get("blkval_passed")
+                or results.get("blkval_failed")
+        ):
+            results["blkval_returncode"] = decode_returncode(procid.returncode)
+
+        for tarmac_filepath in glob.glob(os.path.join("simulate", "tarmac.*.log")):
+            shutil.copyfile(tarmac_filepath, os.path.basename(tarmac_filepath))
+
+    if results.get("blkval_failed") or \
+       results.get("blkval_failure") or \
+       results.get("isscmp_mismatch") or \
+       results.get("uvm_fatal"):
+        results["blkval_undecided"] = False
+        raise FailureException
+
+    if procid.returncode:
+        raise ReturnCodeException
+
+    if results.get("blkval_undecided"):
+        raise UndecidedException
+
+
+def eap_upload_a_test(args, test_name, short_test_name, genasm_mp_path):
+    LOGGER.info("""
+------------------------------------------------------
+------        UPLOAD TEST DETAILS TO EAP         -----
+------------------------------------------------------""")
+
+    try:
+        results["eap_upload_started"] = True
+        results.dump()
+
+        LOGGER.info("Uploading session")
+
+        is_fpga_flow = args.fpga_run or "disable_fpga" in args.configs
+
+        session = SessionSchema(args.eap_project, args.eap_prod, args.project, args.project_core, is_fpga_flow)
+        session["regression_ptr"] = str(args.regr_rid)
+
+        log_filename = os.path.join(genasm_mp_path, "logs", f"{short_test_name}.log")
+        with open(log_filename, "rb") as log_fd:
+            log_file = log_fd.read()
+
+        _, session_rid = session.upload()
+
+        ris_gen_rid = None
+
+        if not args.skipgen:
+            LOGGER.info("Uploading test generation")
+            ris_gen = RISGenSchema(args.eap_project, args.eap_prod, args.project, args.project_core, is_fpga_flow)
+
+            ris_gen['regression_ptr'] = str(args.regr_rid)
+            ris_gen['session_ptr'] = str(session_rid)
+
+            # REVISIT(remsau01, GENMP, set generation_speed with number of instructions/s)
+            ris_gen['test_name'] = test_name
+            ris_gen['test_seed'] = args.seed
+            generation_time = results["generation_time"]
+            ris_gen['gen_real_time'] = generation_time
+            ris_gen['gen_cpu_time'] = generation_time # REVISIT(remsau01, GENMP, should be CPU time not wall-clock)
+
+            if results.get("generation_done", None) and results.get("compilation_done", None):
+                elf_files = get_test_elfs()
+                elf_file_names = [elf for elf in elf_files.values() if elf is not None]
+                ris_gen['test_footprint'] = float(sum(os.stat(elf).st_size for elf in elf_file_names)) / (1024 * 1024)
+                ris_gen['result'] = "OK"
+
+            if results.get("fastsim_done", None):
+                ris_gen['fast_model_validated'] = True
+                ris_gen['fast_model_version'] = results["fastsim_revision"]
+                if results.get("fastsim_undecided", None):
+                    ris_gen['fast_model_run_status'] = "CRASH"
+                elif results.get("fastsim_passed", None):
+                    ris_gen['fast_model_run_status'] = "OK"
+                else:
+                    ris_gen['fast_model_run_status'] = "FAIL"
+
+            ris_gen.attach_file('gmp.log', log_file)
+            _, ris_gen_rid = ris_gen.upload()
+
+        if args.fpga_run:
+            LOGGER.info("Uploading FPGA run")
+            dynamic_test = DynamicTestSchema(args.eap_project, args.eap_prod, args.project, args.project_core, is_fpga_flow)
+
+            dynamic_test['project_code'] = args.eap_lsfproject
+            dynamic_test['run_type'] = "FPGA"
+            dynamic_test['run_subtype'] = "SYSTEM"
+            dynamic_test['flow'] = "GenASM-MP Web FPGA Interface"
+            dynamic_test['vendor'] = "SYNOPSYS"
+            dynamic_test['tool'] = "automation/farm_toolkit"
+            dynamic_test['tool_version'] = args.fpga_run
+            dynamic_test['dut_config_label'] = args.fpga_image # REVISIT(anegar01, GENMP, does not contribute to SID and can be removed later)
+            dynamic_test['dut_project_tag'] = args.fpga_image  # contributes to SID
+            dynamic_test['log_file_name'] = ["gmp.log"]
+
+            cpu_time = results.get("fpga_total_time", 0)
+            dynamic_test["cpu_time"] = cpu_time
+            dynamic_test["real_time"] = cpu_time # REVISIT(remsau01, GENMP, should be CPU time not wall-clock)
+
+            cycles = results.get("fpga_cpu_cycles", 0)
+            dynamic_test['cycles'] = cycles
+
+            if cycles and cpu_time:
+                dynamic_test['cps'] = cycles / cpu_time
+
+            dynamic_test['regression_ptr'] = str(args.regr_rid)
+            dynamic_test['session_ptr'] = str(session_rid)
+            if ris_gen_rid is not None:
+                dynamic_test['gen_ptr'] = str(ris_gen_rid)
+
+            dynamic_test['test_name'] = test_name
+
+            if results.get("fpga_undecided", None):
+                dynamic_test['result'] = "CRASH"
+            elif results.get("fpga_passed", None):
+                dynamic_test['result'] = "OK"
+                dynamic_test['raw_result'] = "PASSED OK"
+            else:
+                dynamic_test['result'] = "FAIL"
+                fail_message = results.get("fpga_failure", "")
+                dynamic_test['raw_result'] = fail_message
+                dynamic_test['fail_message'] = fail_message
+                dynamic_test['fail_signature'] = djb2_hash(fail_message)
+                dynamic_test['fail_time'] = results.get("fpga_cntpct_failure", 0)
+
+            dynamic_test.attach_file('gmp.log', log_file)
+
+            dynamic_test.upload()
+
+        results["eap_upload_done"] = True
+
+    except UploadSkippedException as ex:
+        LOGGER.info(exception_to_str(ex))
+        results["eap_upload_skipped"] = True
+    except Exception as ex:
+        results["eap_upload_exception"] = exception_to_str(ex)
+        raise
+
+def main(args):
+    if args.verbose_level > 0:
+        setLevel(max(10 - args.verbose_level, 0))
+
+    # Set the signal handler and an alarm
+    def raise_exception(cls):
+        raise cls
+
+    signal.signal(signal.SIGALRM, lambda signum, frame: raise_exception(TimeoutException))
+    signal.signal(signal.SIGINT, lambda signum, frame: raise_exception(InterruptException))
+    signal.signal(signal.SIGTERM, lambda signum, frame: raise_exception(TerminateException))
+    signal.signal(signal.SIGUSR2, lambda signum, frame: raise_exception(LSFTimeoutException))
+    signal.signal(signal.SIGXCPU, lambda signum, frame: raise_exception(LSFMemoryException))
+    signal.signal(signal.SIGXFSZ, lambda signum, frame: raise_exception(LSFFileException))
+
+    # -- Verify command line --
+    assert not(args.minitb and args.fastsim), "MiniTB and FastSim are not compatible"
+
+    popeye_path, genasm_mp_path = get_environment(args.dir)
+    retcode = 0
+
+    # -- Check environment : Make sure dir structure exists --
+    if args.resetenv or not pathlib.Path(genasm_mp_path).exists():
+        resetenv(genasm_mp_path, args.minitb_dir)
+    if args.minitb_dir or args.resetenv:
+        if not args.project:
+            return retcode
+    assert args.project, "Please specify a project"
+
+    # Get the arch_const of the project to check if SPE is enabled
+    project_has_spe = get_factory(args.project).get_arch_const().FEAT_SPE
+
+    try:
+        build_options = FakeBuildOptions(args.project_core,
+                                         args.nb_cpu,
+                                         args.nb_cluster,
+                                         args.threads_per_cpu,
+                                         args.nb_rn_bfm,
+                                         args.nb_acp,
+                                         args.ecc,
+                                         "on" if project_has_spe else "off")
+        if args.name:
+            test_name = short_test_name = args.name
+        else:
+            test_name_handler = TestName(
+                    gitdirty="dirty" in results['popeye_git_desc'],
+                    gitsha1=results['popeye_git_sha1'],
+                    clusters=args.nb_cluster,
+                    cpus=args.nb_cpu,
+                    threads=args.threads_per_cpu,
+                    rnbfms=args.nb_rn_bfm,
+                    acps=args.nb_acp,
+                    seed=args.seed,
+                    project=args.project,
+                    project_cores=args.project_core,
+                    configs=args.configs,
+            )
+            test_name = test_name_handler.encode(hash_configs=False)
+            if args.short_cfg or len(test_name) > 240:
+                short_test_name = test_name_handler.encode(hash_configs=True)
+            else:
+                short_test_name = test_name
+
+            assert len(short_test_name) < 240, "Test name will be too long for filesystem"
+
+        test_path = os.path.join(genasm_mp_path, "tests", short_test_name)
+        try:
+            os.mkdir(test_path)
+        except FileExistsError:
+            pass
+        os.chdir(test_path)
+        initFileHandler(os.path.join(genasm_mp_path, "logs", f"{short_test_name}.log"))
+
+        if "platform_checker" in args.configs:
+            # Adjust test name and "generate" empty test file
+            args.skipgen = True
+            with open("test.a64.s", 'w'):
+                pass
+
+        fix_test_configs(args.configs)
+
+        if not args.arg_file:
+            set_last_test_name(args.dir, short_test_name)
+
+        LOGGER.info("TEST_NAME: %s", test_name)
+        if test_name != short_test_name:
+            LOGGER.info("SHORT_TEST_NAME: %s", short_test_name)
+
+        results["test_name"] = test_name
+        results["short_test_name"] = short_test_name
+        stats["test_name"] = test_name
+
+        results.dump()
+
+        if not args.skipgen or "platform_checker" in args.configs:
+            if args.pudb:
+                import pudb # pylint: disable=import-error,import-outside-toplevel
+                try:
+                    gen = pudb.runcall(generate_a_test,
+                                       build_options,
+                                       args,
+                                       test_name,
+                                       short_test_name,
+                                       genasm_mp_path)
+                except: # pylint: disable=bare-except
+                    pudb.post_mortem()
+            elif args.pdb:
+                gen = pdb.runcall(generate_a_test,
+                                  build_options,
+                                  args,
+                                  test_name,
+                                  short_test_name,
+                                  genasm_mp_path)
+            else:
+                gen = generate_a_test(build_options,
+                                      args,
+                                      test_name,
+                                      short_test_name,
+                                      genasm_mp_path)
+
+            gen.generate_compilation_metadata("compilation.json")
+            gen.generate_linker_metadata("linker.json")
+            gen.generate_fastsim_metadata("fastsim.json")
+            generate_loopback_file(get_total_cpus(args))
+
+        results.dump()
+
+        if not args.skipmake and args.nb_cpu > 0:
+            compile_a_test(args, popeye_path)
+            results.dump()
+
+        if args.patch:
+            patch_a_test(args.patch)
+            results.dump()
+
+        if args.fastsim:
+            assert args.nb_cpu > 0
+            assert args.nb_rn_bfm == 0
+
+            fastsim_a_test(args, popeye_path)
+            results.dump()
+
+
+        if args.acme:
+            assert args.nb_cpu > 0
+            assert args.nb_rn_bfm == 0
+            acme_a_test(args.maxruntime, args.acme_config, args.tarmac)
+            results.dump()
+
+        if args.minitb and not args.skiprun:
+            assert args.nb_cpu > 0
+            assert args.nb_rn_bfm == 0
+            minitb_a_test(args,
+                          args.fill_zeroes,
+                          short_test_name,
+                          args.minitb_simbuild,
+                          args.nb_cpu,
+                          args.sim,
+                          args.project_run,
+                          genasm_mp_path)
+            results.dump()
+
+        if args.utb and not args.skiprun:
+            assert args.nb_cpu > 0
+            assert args.nb_rn_bfm == 0
+            utb_blk_val_a_test(args.build_rtl,
+                               args.update_rtl,
+                               args.bo,
+                               args.project_run,
+                               args.tb_seed if args.tb_seed else args.seed & ((1 << 32) - 1),
+                               args.nb_cluster,
+                               args.nb_cpu,
+                               test_name,
+                               args.sim,
+                               args.fsdb,
+                               args.fill_zeroes,
+                               args.dcc,
+                               args.maxruncycles,
+                               args.maxruntime,
+                               args.logmem,
+                               args.isscmp,
+                               list(args.simopts),
+                               popeye_path,
+                               genasm_mp_path)
+            results.dump()
+
+        if args.fpga_run:
+            assert args.nb_cpu > 0
+            assert args.nb_rn_bfm == 0
+            fpga_a_test(popeye_path,
+                        args.maxruntime,
+                        args.fpga_hex,
+                        args.fpga_run,
+                        args.fpga_board,
+                        args.fpga_image,
+                        args.fpga_options,
+                        args.project_run)
+
+    except TestRunException as ex:
+        LOGGER.warning(ex.__class__.__name__)
+        if args.verbose_level:
+            traceback.print_exc()
+        retcode = ex.retcode
+
+    except Exception as ex: # pylint: disable=broad-except
+        LOGGER.warning(str(ex))
+        traceback.print_exc()
+        results["internal_exception"] = exception_to_str(ex)
+        retcode = 1
+
+    finally:
+        results.dump()
+
+    if args.gmpxcmp and (results.get("fastsim_passed") or results.get("fastsim_failed")):
+        LOGGER.info("""
+-------------------------------------------
+------     genasm_mp_exec_compare     -----
+-------------------------------------------""")
+        compare_command = ['genasm_mp_exec_compare', short_test_name, '--dir', genasm_mp_path]
+        LOGGER.info(' '.join(compare_command))
+        results["exec_compare_started"] = True
+        try:
+            procid = subprocess.Popen(compare_command,
+                                      cwd=genasm_mp_path,
+                                      text=True,
+                                      stdout=subprocess.PIPE,
+                                      stderr=subprocess.STDOUT)
+            for line in ProcessReader(procid.stdout):
+                LOGGER.info(line)
+
+                if "failure:" in line:
+                    msg = line.split("failure:")[1].strip()
+                    results["exec_compare_failure"] = msg
+        except InterruptException:
+            results["exec_compare_interrupted"] = True
+        except LSFTimeoutException:
+            results["exec_compare_lsf_timeout"] = True
+        except LSFMemoryException:
+            results["exec_compare_lsf_memory"] = True
+        except LSFFileException:
+            results["exec_compare_lsf_file"] = True
+        finally:
+            if procid.wait() and not (
+                    results.get("exec_compare_interrupted")
+                    or results.get("exec_compare_failure")
+                    or results.get("exec_compare_lsf_timeout")
+                    or results.get("exec_compare_lsf_memory")
+                    or results.get("exec_compare_lsf_file")
+            ):
+                retcode = procid.returncode
+                results["exec_compare_returncode"] = decode_returncode(retcode)
+            else:
+                results["exec_compare_success"] = True
+
+        results.dump()
+
+    LOGGER.info("""
+------------------------------------------------------
+------     EXECUTING POST PROCESSING ACTIONS     -----
+------------------------------------------------------""")
+
+    if args.regr_rid:
+        try:
+            eap_upload_a_test(args, test_name, short_test_name, genasm_mp_path)
+        except Exception as ex: # pylint: disable=broad-except
+            LOGGER.warning(str(ex))
+            traceback.print_exc()
+            results["internal_exception"] = exception_to_str(ex)
+            retcode = 1
+        finally:
+            results.dump()
+
+    if args.postclean and (not retcode or args.force_clean):
+        postclean(genasm_mp_path, short_test_name, args.postclean)
+
+    LOGGER.info("TEST_NAME: %s", test_name)
+    if test_name != short_test_name:
+        LOGGER.info("SHORT_TEST_NAME: %s", short_test_name)
+    LOGGER.info("GenASM-MP job finished")
+
+    return retcode
+
+def run():
+    args = fix_args(parse_args())
+    if args.profile:
+        pr = Profile()
+        pr.enable()
+        retval = pr.runcall(main, args)
+        pr.disable()
+        pr.dump_stats(args.profile)
+        pstats.Stats(pr).sort_stats("tottime").print_stats()
+        return retval
+    else:
+        return main(args)
+
+if __name__ == "__main__":
+    sys.exit(run())

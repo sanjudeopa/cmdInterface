@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+# pylint: disable=missing-docstring
+
+import sys
+from argparse import ArgumentParser, FileType
+from lib_generator.popeye_factory import get_factory
+
+def main(argv):
+    parser = ArgumentParser(description="Generator of image68 file for uninitialized addresses")
+
+    parser.add_argument("--if", dest="ifile", metavar="FILE",
+                        type=FileType('r'), default=sys.stdin,
+                        help="input data set", required=False)
+
+    parser.add_argument("--ofs", dest="ofiles", metavar="FILE",
+                        type=FileType('w'), default=None,
+                        help="output data set in secure space", required=True)
+
+    parser.add_argument("--ofns", dest="ofilens", metavar="FILE",
+                        type=FileType('w'), default=None,
+                        help="output data set in non-secure space", required=True)
+
+    parser.add_argument("--ofrealm", dest="ofilerealm", metavar="FILE",
+                        type=FileType('w'), default=None,
+                        help="output data set in realm space", required=True)
+
+    parser.add_argument("--ofroot", dest="ofileroot", metavar="FILE",
+                        type=FileType('w'), default=None,
+                        help="output data set in root space", required=True)
+
+    parser.add_argument("--oftags", dest="ofiletags", metavar="FILE",
+                        type=FileType('w'), default=None,
+                        help="output tag set in secure space", required=True)
+
+    parser.add_argument("--oftagns", dest="ofiletagns", metavar="FILE",
+                        type=FileType('w'), default=None,
+                        help="output tag set in non-secure space", required=True)
+
+    parser.add_argument("--oftagrealm", dest="ofiletagrealm", metavar="FILE",
+                        type=FileType('w'), default=None,
+                        help="output tag set in realm space", required=True)
+
+    parser.add_argument("--oftagroot", dest="ofiletagroot", metavar="FILE",
+                        type=FileType('w'), default=None,
+                        help="output tag set in root space", required=True)
+
+    parser.add_argument("--project", dest="project", type=str, default=None,
+                        help="project name", required=True)
+
+    args = parser.parse_args(argv)
+
+    imp_def_const = get_factory(args.project).get_imp_def_const()
+
+    processed_addr_data = set()
+    processed_addr_tag = set()
+
+    for line in args.ifile:
+        space, addr = line.rstrip().split(":")
+        addr = base_addr = int(addr, 16) & ~0x7
+        tag_addr = base_tag_addr = addr & ~0xf
+
+        if "NS" in space:
+            ofile = args.ofilens
+            ofiletag = args.ofiletagns
+            nse_ns = 0b01
+        elif "REALM" in space:
+            ofile = args.ofilerealm
+            ofiletag = args.ofiletagrealm
+            nse_ns = 0b11
+        elif "ROOT" in space:
+            ofile = args.ofileroot
+            ofiletag = args.ofiletagroot
+            nse_ns = 0b10
+        else:
+            ofile = args.ofiles
+            ofiletag = args.ofiletags
+            nse_ns = 0b00
+
+        addr |= nse_ns << imp_def_const.NS_BIT_POSITION
+        tag_addr |= nse_ns << imp_def_const.NS_BIT_POSITION
+
+        if "TAG" in space:
+            if tag_addr not in processed_addr_tag:
+                processed_addr_tag.add(tag_addr)
+
+                ofiletag.write("1{:016x}\n".format(base_tag_addr))
+                default_tag = imp_def_const.get_default_tag_value_l3(tag_addr)
+                duplicated_tag_value = "{0:015x}".format(sum(default_tag << (8 * n) for n in range(8)))
+                ofiletag.write("0{0}\n0{0}\n".format(duplicated_tag_value))
+        else:
+            if addr not in processed_addr_data:
+                processed_addr_data.add(addr)
+
+                ofile.write("1{:016x}\n".format(base_addr))
+                ofile.write("0{:016x}\n".format(imp_def_const.get_default_value_l3(addr)))
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

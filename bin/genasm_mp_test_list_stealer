@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+
+"""
+This script aims to list the configurations present in popeye regression
+list files that are not present in genasm_mp/default_asm.list.
+
+Some notes:
+- Test_all is ignored
+- Weights at the beginning of the lines are not displayed
+- TAGS keyword is not displayed as it is not compatible with GenASM-MP
+- The order of the items in a line can be different from what it appears
+  in the files
+"""
+
+import os
+import argparse
+from typing import Set, List
+
+def parse_line(line: str) -> Set[str]:
+    """
+    From a line taken from a regression list file returns
+    a set containing the configuration that line is made of.
+    Discards the weight, eventual comments and TAGS trailing
+    objects.
+    Returns an empty set if the line is empty.
+    """
+
+    # Clean input
+
+    if line.find('#') >= 0:
+        line = line[:line.find('#')] # Remove comments
+    line = line.strip()
+
+    elem = line.split(' ')
+
+    # Remove the weight if present at the beginning of the line
+    if len(elem) > 0 and elem[0].isnumeric():
+        elem = elem[1:]
+
+    return {e for e in elem if e and not e.startswith('TAGS')}
+
+def find_in_list(list_to_check: List[Set[str]],
+                 obj_to_find: Set[str]) -> bool:
+    """
+    Returns True if L{obj_to_find} appears in the L{list_to_check}.
+    Returns False otherwise.
+    """
+    return any(obj.symmetric_difference(obj_to_find).issubset({'test_all'}) for obj in list_to_check)
+
+def compute_config_list(regr_file: str) -> List[Set[str]]:
+    """
+    Compute the list of configurations of the given
+    L{regr_file}.
+    """
+    list_of_tests = []
+
+    with open(regr_file, 'r') as file_desc:
+        for line in file_desc:
+            obj = parse_line(line)
+
+            if len(obj) > 0:
+                list_of_tests.append(obj)
+
+    return list_of_tests
+
+def compute_missing_configs(regr_file: str,
+                            existing_list: List[Set[str]]) -> List[Set[str]]:
+    """
+    Returns a list of elements that were found in
+    L{regr_file} and that were not present in the
+    input L{existing_list} list.
+    """
+    list_of_missing_tests = []
+
+    with open(regr_file, 'r') as file_desc:
+        for line in file_desc:
+            obj = parse_line(line)
+
+            if len(obj) > 0 and not find_in_list(existing_list, obj):
+                list_of_missing_tests.append(obj)
+
+    return list_of_missing_tests
+
+def main():
+    " Entry point of the script "
+
+    popeye_home = os.getenv("POPEYE_HOME")
+
+    parser = argparse.ArgumentParser(description='List the configuration present in popeye .list files that are not present in default_asm.list')
+
+    parser.add_argument("--genasm_file",
+                        type=str,
+                        default="regression/genasm_mp/default_asm.list",
+                        help="Genasm regression list file")
+    parser.add_argument("--popeye_files",
+                        type=str,
+                        nargs="+",
+                        default=["regression/popeye/scpu.list",
+                                 "regression/popeye/default_klein.list"],
+                        help="Popeye regression list files (by default looks for scpu.list and default_klein.list)")
+    args = parser.parse_args()
+
+    # Parse genasm_file
+    genasm_file = os.path.join(popeye_home, args.genasm_file)
+    asm_list = compute_config_list(genasm_file)
+    missing_list = []
+
+    # Parse popeye files
+    for popeye_file in args.popeye_files:
+        file_path = os.path.join(popeye_home, popeye_file)
+        missing_list += compute_missing_configs(file_path, asm_list + missing_list)
+
+    # Print the result
+    for config in missing_list:
+        print(" ".join(config))
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,556 @@
+#!/usr/bin/env python3
+"Look for zombie TODOs and REVISITs"
+
+import os
+import sys
+import argparse
+import re
+import getpass
+import json
+import subprocess
+
+from http.client import HTTPSConnection
+from base64 import b64encode
+from collections import defaultdict
+from infra.gerrit.build_and_test_gerrit_hook import Rejecter, TestGerritLineRejectionHookRegex
+from infra.gerrit.regex import (
+        TAG, PERMISSIVE_PROJECT_MILESTONE, STRICT_PROJECT_MILESTONE, JIRA,
+        FORMATTABLE_FORMAT_1, FORMATTABLE_FORMAT_2, FORMATTABLE_FORMAT_3
+)
+from lib_shared.const_log import getStdoutLogger
+
+LOGGER = getStdoutLogger(__name__)
+
+# Some formatting
+RED = "\033[91m"
+BLUE = '\033[94m'
+GREEN = '\033[92m'
+BOLD = '\033[1m'
+RESET = '\033[0m'
+
+FORMAT_RED = RED + "{}" + RESET
+FORMAT_GREEN = GREEN + "{}" + RESET
+
+FORMAT_BOLD = BOLD + "{}" + RESET
+FORMAT_BOLD_RED = FORMAT_BOLD.format(RED + "{}")
+FORMAT_BOLD_BLUE = FORMAT_BOLD.format(BLUE + "{}")
+
+class ParsingError(Exception):
+    "Exception generated when there is an issue parsing an action correctly"
+
+class QuitInteractiveMode(Exception):
+    "Exception raise when the user wants to quit 'interactive' mode"
+
+class ActionsLibrary:
+    "Class gathering actions in a targeted path"
+
+    def __init__(self, target_path, verbosity):
+        self.file_to_action_d = defaultdict(list)
+        self.jira_d = defaultdict(list)
+        self.verbosity = verbosity
+
+        self.rejecter_object = Rejecter((
+                re.compile("(REVSIT|REVIST|REVIIT|revisit|revsit|revist|reviit|todo)"),
+                re.compile(TestGerritLineRejectionHookRegex().create_regex()),
+        ))
+
+        self.regex_objects = {PERMISSIVE_PROJECT_MILESTONE: re.compile(PERMISSIVE_PROJECT_MILESTONE),
+                              JIRA: re.compile(JIRA),
+                              STRICT_PROJECT_MILESTONE: re.compile(STRICT_PROJECT_MILESTONE)}
+
+        self.init_actions(target_path)
+
+    def init_actions(self, path):
+        "Gets all the actions from path"
+        pattern = re.compile(TAG)
+        file_to_action_d = self.file_to_action_d
+        jira_d = self.jira_d
+        for subpath in find_filepaths(path):
+            try:
+                with open(subpath) as file:
+                    for line_num, line_str in enumerate(file, start=1):
+                        if pattern.search(line_str):
+                            try:
+                                action = Action(line_str=line_str,
+                                                line_num=line_num,
+                                                filepath=subpath,
+                                                regex_objects_d=self.regex_objects,
+                                                verbosity=self.verbosity)
+                            except ParsingError:
+                                continue
+                            file_to_action_d[subpath].append(action)
+                            if action.jira_name is not None:
+                                jira_d[action.jira_name].append(action)
+            except UnicodeDecodeError:
+                pass # Probably a binary file, let's give it to skippy !
+
+    def get_filtered_actions(self, target_user):
+        "Filters out the irrelevant actions"
+        if target_user is None:
+            return self.file_to_action_d
+
+        ret_d = defaultdict(list)
+        for filepath, actions_l in self.file_to_action_d.items():
+            for action in actions_l:
+                if action.assignee != target_user:
+                    continue # This action is irrelevant, let's give it to skippy !
+                ret_d[filepath].append(action)
+        return ret_d
+
+    def get_filtered_jiras(self, target_user):
+        "Filters out the irrelevant jiras"
+        if target_user is None:
+            return self.jira_d
+
+        ret_d = defaultdict(list)
+        for jira_name, actions_l in self.jira_d.items():
+            for action in actions_l:
+                if action.assignee != target_user:
+                    continue # This jira is irrelevant, let's give it to skippy !
+                ret_d[jira_name].append(action)
+        return ret_d
+
+    def print_actions(self, target_user):
+        "Prints out relevant actions"
+        file_to_action_d = self.get_filtered_actions(target_user)
+
+        for filename, actions_l in file_to_action_d.items():
+            nb_jiras = len([action for action in actions_l if action.jira_name is not None])
+            highlight_suffix = "#"*20 if self.verbosity else " -"
+            print(f"{highlight_suffix} {filename} - {len(actions_l)} actions - {nb_jiras} jiras")
+
+            for action in actions_l:
+                verbose_str = f"{filename}:{action.line_num} " if self.verbosity else "    "
+                print(f"{verbose_str} - {action}")
+            print()
+
+
+    def modify_actions(self, target_user): #pylint: disable=too-many-statements
+        "Modifies relevant actions"
+        file_to_action_d = self.get_filtered_actions(target_user)
+        total_actions = 0
+        already_healthy_nb = 0
+        global_successfully_replaced = 0
+        weirdly_formatted = 0
+        try:
+            for filename, actions_l in file_to_action_d.items():
+                local_successfully_replaced = 0
+                actions_len = len(actions_l)
+                if self.verbosity:
+                    print(f"########################################### {filename}")
+                for action in actions_l:
+
+                    cmd = ["sed", "-i"]
+                    prepare_some_characters_for_sed = action.description.replace("\\", r"\\").replace("/", r"\/") \
+                                                                        .replace("'", "\'").replace("\"", r"\"") \
+                                                                        .replace("(", r"\(").replace(")", r"\)") \
+                                                                        .replace("+", r"\+").replace("-", r"\-") \
+                                                                        .replace("?", r"\?").replace("!", r"\!")
+                    pattern_1 = re.compile(rf"{FORMATTABLE_FORMAT_1.format(action.assignee, action.milestone, prepare_some_characters_for_sed, action.jira_name)}")
+                    pattern_2 = re.compile(rf"{FORMATTABLE_FORMAT_2.format(prepare_some_characters_for_sed, action.jira_name)}")
+                    pattern_3 = re.compile(rf"{FORMATTABLE_FORMAT_3.format(prepare_some_characters_for_sed, action.assignee, action.milestone)}")
+                    if pattern_1.search(action.line_str):
+                        to_be_replaced = f"{action.assignee}, {action.milestone}, {prepare_some_characters_for_sed}"
+                        if action.jira_name:
+                            to_be_replaced += f", {action.jira_name}"
+
+                        if action.jira_name:
+                            to_replace = f"{prepare_some_characters_for_sed}, {action.jira_name}"
+                        else:
+                            to_replace = f"{prepare_some_characters_for_sed}, {action.assignee}, {action.milestone}"
+
+                    elif pattern_2.search(action.line_str) or pattern_3.search(action.line_str):
+                        # no correction to be done
+                        already_healthy_nb += 1
+                        continue
+                    else:
+                        if self.verbosity > 1:
+                            LOGGER.warning("Can't replace TODO/REVISIT from %s:%d", filename, action.line_num)
+                        continue
+
+                    old_format = f"{action.tag}({to_be_replaced})"
+                    replacement_check = f"{action.tag}({to_replace})"
+                    if self.rejecter_object.rejects(replacement_check):
+                        weirdly_formatted += 1
+                        if self.verbosity > 1:
+                            LOGGER.warning("Weirdly formatted %s in %s:%d so skipping it!", replacement_check, filename, action.line_num)
+                        continue
+
+
+                    question_would_you_like = "Would you like to replace "
+                    question_by = "by: "
+                    question_part_2 = question_by + " " * (len(question_would_you_like) - len(question_by))
+                    message = f"{question_would_you_like}{FORMAT_RED.format(old_format)}\n" \
+                              f"{question_part_2}{FORMAT_GREEN.format(replacement_check)}\n" \
+                              f"{FORMAT_BOLD_BLUE.format('Replace [y,n,q,?]?) ')}"
+                    message_not_correct = FORMAT_BOLD_RED.format("y - Yes; replace\n" \
+                                                                 "n - No; do not replace\n" \
+                                                                 "q - quit; do not replace this action or any of the remaining ones\n" \
+                                                                 "? - print help")
+                    input_options = ("Y", "y", "N", "n", "Q", "q")
+                    user_input = user_input_loop(message, message_not_correct, input_options)
+                    if user_input in ("N", "n"):
+                        continue
+                    # else y was selected
+
+                    cmd += [f"\"s/{to_be_replaced}/{to_replace}/g\"", filename]
+                    cmd_str = ' '.join(cmd)
+                    try:
+                        subprocess.run(cmd_str, shell=True, check=True)
+                        local_successfully_replaced += 1
+                    except subprocess.CalledProcessError:
+                        LOGGER.warning("Can't execute %s\nSomething wrong happened.", cmd_str)
+
+                if self.verbosity > 1:
+                    LOGGER.info("Replaced %d/%d", local_successfully_replaced, actions_len)
+
+                global_successfully_replaced += local_successfully_replaced
+                total_actions += actions_len
+
+        except QuitInteractiveMode:
+            pass
+
+        if self.verbosity:
+            print("########################################### SUMMARY")
+            LOGGER.info("Already healthy in total %d/%d", already_healthy_nb, total_actions)
+            LOGGER.info("Replaced in total %d/%d", global_successfully_replaced, total_actions - already_healthy_nb)
+
+class Action:
+    "An action is any todo/revisit describing a future improvement planned on one section of the code."
+    def __init__(self, line_str, line_num, filepath, regex_objects_d, verbosity):
+        self.line_str = line_str
+        self.line_num = line_num
+        self.filepath = filepath
+
+        self.tag = None
+
+        # parsing objects
+        self.regex_permissive_milestone_obj = regex_objects_d[PERMISSIVE_PROJECT_MILESTONE]
+        self.regex_strict_milestone_obj = regex_objects_d[STRICT_PROJECT_MILESTONE]
+        self.regex_jira_obj = regex_objects_d[JIRA]
+
+        self.assignee, self.milestone, self.description, self.jira_name = self.parse(verbosity)
+        self.jira_obj = None
+
+    def __str__(self):
+        return f"{(self.assignee, self.milestone, self.description, self.jira_name)}"
+
+    def register_jira(self, jira_obj):
+        assert self.jira_obj is None, "a Jira obj was already registered... what a [computing] waste!"
+        self.jira_obj = jira_obj
+        if self.assignee is None:
+            self.assignee = jira_obj.get_assignee_username()
+        if self.milestone is None:
+            self.milestone = jira_obj.get_target_delivery()
+
+    def check_if_wanted_assignee(self, target_user):
+        return self.assignee == target_user
+
+    def _parse_new(self, line, verbosity):
+        attr = [elem.strip() for elem in line.split(",")]
+        if len(attr) == 3:
+            description, assignee, milestone = attr
+            jira = None
+
+            # There is a legacy format where it's also 3 attrs, in
+            # a different order - detect it by checking milestone field
+            if not self.regex_strict_milestone_obj.match(milestone):
+                raise ParsingError(attr)
+
+            if self.regex_jira_obj.match(description) and verbosity > 1:
+                # there is a jira inside a comment
+                print(f"WARNING: Line having a jira inside a description/comment filed: {line}, should it be moved inside the jira field ?")
+        else:
+            try:
+                description, jira = attr
+                assignee = milestone = None
+
+                regex_obj = re.compile(JIRA)
+                if not regex_obj.search(jira):
+                    raise ParsingError(attr)
+            except ValueError:
+                raise ParsingError(attr)
+
+        return assignee, milestone, description, jira
+
+    def _parse_legacy(self, line, verbosity):
+        attr = [elem.strip() for elem in line.split(",")]
+        if len(attr) == 3:
+            assignee, milestone, description = attr
+            jira = None
+
+            if self.regex_jira_obj.match(description) and verbosity > 1:
+                # there is a jira inside a comment
+                print(f"WARNING: Line having a jira inside a description/comment filed: {line}, should it be moved inside the jira field ?")
+
+        else:
+            try:
+                assignee, milestone, description, jira = attr
+
+                if not self.regex_jira_obj.search(jira):
+                    raise ParsingError(attr)
+            except ValueError:
+                raise ParsingError(attr)
+
+        return assignee, milestone, description, jira
+
+    def parse(self, verbosity):
+        line = self.line_str
+        if "TODO" in line:
+            self.tag = "TODO"
+            line = line[line.find("TODO"):].replace("TODO", "")
+        elif "REVISIT" in line:
+            self.tag = "REVISIT"
+            line = line[line.find("REVISIT"):].replace("REVISIT", "")
+        else:
+            print(f"Couldn't parse the line: '{line}'")
+            assert False, "this function expects a line with a TODO/REVISIT"
+
+        line = line[line.find("(")+1:] # keep the content from the first '(' char
+        line = line[:line.find(")")] # keep the content until the last ')' char
+        try:
+            assignee, milestone, description, jira_name = self._parse_new(line, verbosity)
+        except ParsingError:
+            assignee, milestone, description, jira_name = self._parse_legacy(line, verbosity)
+
+        return assignee, milestone, description, jira_name
+
+
+class JiraTicket:
+    "Structure containing information relative to a Jira ticket."
+    def __init__(self, data):
+        self.name = data["key"]
+        fields = data["fields"]
+        self._assignee = fields["assignee"]
+        self.status = fields["status"]["name"]
+        self.title = fields["summary"]
+        self.type = fields["issuetype"]["name"]
+        self.target_delivery = fields["fixVersions"][0] if fields["fixVersions"] else None
+        if self._assignee is None:
+            # in this case, let's flag the reporter instead
+            self._assignee = fields["reporter"]
+
+    def is_done(self):
+        return "Closed" in self.status or "Completed" in self.status
+
+    def get_assignee_email(self):
+        return self._assignee["emailAddress"]
+
+    def get_assignee_name(self):
+        return self._assignee["displayName"]
+
+    def get_assignee_username(self):
+        return self._assignee["name"]
+
+    def get_target_delivery(self):
+        return self.target_delivery["name"] if self.target_delivery else None
+
+    def __str__(self):
+        return f"{self.name}: {self.title} [{self.status}]"
+
+def request_jira_api(query, encrypted_credentials):
+    conn = HTTPSConnection("jira.arm.com")
+
+    headers = {"Authorization": f"Basic {encrypted_credentials}",
+               "Content-Type": "application/json"}
+
+    conn.request("GET", f"/rest/api/2/{query}", headers=headers)
+    rsp = conn.getresponse()
+    if rsp.status != 200:
+        raise Exception(f"Unexpected status code returned from the server ({rsp.status} {rsp.reason} {query})")
+    return json.loads(rsp.read())
+
+def get_jira(jira_l, encrypted_credentials):
+    result_d = request_jira_api("search?jql=" + "+or+".join([f"id={jira}" for jira in jira_l]), encrypted_credentials)
+    return {jira["key"]: JiraTicket(jira) for jira in result_d["issues"]}
+
+def get_project_status(project, encrypted_credentials):
+    project_milestones = request_jira_api(f"project/{project}/version", encrypted_credentials)["values"]
+    released_milestones_d = {entry["name"]: entry["released"] for entry in project_milestones}
+    return released_milestones_d
+
+def find_filepaths(path):
+    ret = []
+    if os.path.islink(path):
+        return ret # skip the symlinks
+    if os.path.isdir(path):
+        for el in os.listdir(path):
+            ret += find_filepaths(os.path.join(path, el))
+        return ret
+
+    if os.path.isfile(path):
+        if not any(not_interesting in path for not_interesting in ("track_todo_revisit", "build_and_test_gerrit_hook")): # except not interesting files
+            ret.append(path)
+    return ret
+
+def get_credentials():
+    user = os.getenv("USER")
+    pwd = getpass.getpass(prompt=f"Jira password for {user}: ", stream=None)
+    return b64encode(f"{user}:{pwd}".encode('utf-8')).decode("ascii")
+
+def cross_actions_vs_jira(file_to_action_d, jira_obj_d):
+    for _, actions_l in file_to_action_d.items():
+        for action in actions_l:
+            if action.jira_name is not None:
+                if action.jira_name not in jira_obj_d:
+                    LOGGER.warning("Jira name %s is not contained in jira_obj_d", action.jira_name)
+                    continue # let's give it to skippy !
+                action.register_jira(jira_obj_d[action.jira_name])
+
+def user_input_loop(message, info_message_not_correct, possible_options):
+    user_input = ""
+    while user_input not in possible_options:
+        user_input = input(message)
+        if user_input not in possible_options or user_input == "?":
+            print(info_message_not_correct)
+
+    if user_input in ("Q", "q"):
+        raise QuitInteractiveMode
+
+    return user_input
+
+def main(args): # pylint: disable=too-many-branches,too-many-statements
+    "track forgotten TODO/REVISITs in the given folder tree"
+
+    if args.pudb:
+        try:
+            import pudb # pylint: disable=import-error,import-outside-toplevel
+            pudb.set_trace()
+        except ImportError as ex:
+            raise RuntimeError("You need to either:\n1) load the appropriate pudb module or\n" \
+                                                    "2) install pudb with pip using command 'pip3 install pudb --user'") from ex
+    elif args.debugpy:
+        try:
+            import debugpy # pylint: disable=import-error,import-outside-toplevel
+            debugpy.listen(args.debugpy) # Specify port to listen (by default on localhost)
+            print(f"Waiting for debugger attach on port {args.debugpy}")
+            debugpy.wait_for_client() # Wait for the StudioCode debugger to attach
+            debugpy.breakpoint() # Configure a first breakpoint once Attach
+        except ImportError as ex:
+            raise RuntimeError("You need to install debugpy with the command 'pip3 install debugpy --user'") from ex
+
+    actions_library = ActionsLibrary(args.target, args.verbosity)
+
+    file_to_all_action_d = actions_library.file_to_action_d
+    all_jira_d = actions_library.jira_d
+    jira_project_d = {}
+
+    nb_total_actions = sum(len(file_to_all_action_d[key]) for key in file_to_all_action_d)
+    if not nb_total_actions:
+        print("No action found: there is nothing more we can do for you dude.")
+        return 0
+    print(f"{nb_total_actions} actions found ({len(all_jira_d)} jiras referenced).")
+    if args.user is not None:
+        file_to_action_d = actions_library.get_filtered_actions(args.user)
+        nb_filtered_actions = sum(len(file_to_action_d[key]) for key in file_to_action_d)
+        print(f"{nb_filtered_actions} of them are assigned to {args.user} (without associated jiras)")
+
+    # print_actions
+    if args.parse_only:
+        if args.user:
+            LOGGER.warning("The following printed actions do not contain possible associated jiras to user %s.", args.user)
+            message = FORMAT_BOLD_BLUE.format("Do you want to continue Y/N?")
+            message_not_correct = FORMAT_BOLD_RED.format("y - Yes; continue and show actions\n" \
+                                                         "n - No; quit\n" \
+                                                         "? - print help")
+            possible_options =  ("Y", "y", "N", "n")
+            user_input = user_input_loop(message, message_not_correct, possible_options)
+            if user_input in ("N", "n"):
+                return 0
+        actions_library.print_actions(args.user)
+        return 0
+    elif args.interactive_update:
+        actions_library.modify_actions(args.user)
+        return 0
+
+    encrypted_credentials = get_credentials()
+
+    try:
+        jira_obj_d = get_jira(all_jira_d.keys(), encrypted_credentials)
+    except Exception:
+        indent = "  - "
+        print("Oops, we got an issue while fetching the status of the following Jiras from Jira server:\n")
+        print(f"{indent}" + f"\n{indent}".join(all_jira_d.keys()))
+        raise
+
+    # Some actions might reference a Jira but have no explicit {assignee, milestone}. In this case, we deduce
+    # the missing fields from the associated Jira.
+    cross_actions_vs_jira(file_to_all_action_d, jira_obj_d)
+
+    if args.show:
+        actions_library.print_actions(args.user)
+        return 0
+
+    print("Now looking for the zombies...")
+
+    jira_d = actions_library.get_filtered_jiras(args.user)
+
+    # 1) Look for the explicitely linked Jiras
+    zombie_jira_l = []
+    for jira in jira_d.keys():
+        if jira_obj_d[jira].is_done():
+            zombie_jira_l.append(jira_obj_d[jira])
+
+    # 2) Also look for the explicitely written milestones
+    zombie_milestone_l = []
+    for _, actions in file_to_action_d.items():
+        for action in actions:
+            if action.jira_name is not None:
+                # Skip it, we can fairly assume that the Jira check (step 1) was enough.
+                continue
+            if action.milestone:
+                try:
+                    target_milestone, project_key = action.milestone.split(".")
+                    if project_key not in jira_project_d:
+                        jira_project_d[project_key] = get_project_status(project_key, encrypted_credentials)
+                    if jira_project_d[project_key][target_milestone]:
+                        zombie_milestone_l.append(action)
+                except Exception: #pylint: disable=broad-except
+                    # Here, we don't want to crash, in order to continue to do as much possible checks as possible...
+                    # But we should probably raise warning here...
+                    pass
+
+    # Print some stats
+    nb_zombies = sum(len(jira_d[key.name]) for key in zombie_jira_l) + len(zombie_milestone_l)
+    print(f"{nb_zombies} zombie(s) spotted over {nb_total_actions} actions checked.")
+    print("")
+    for jira in zombie_jira_l:
+        print(f" - {jira}")
+        for action in jira_d[jira.name]:
+            print(f"    - {action}")
+    if zombie_milestone_l:
+        print(" - NO JIRA")
+    for action in zombie_milestone_l:
+        print(f"    - {action}")
+    return nb_zombies
+
+
+def get_args():
+    "parses the command line arguments and returns a named tuple"
+
+    def is_target_valid(path):
+        if os.path.isdir(path) or os.path.isfile(path):
+            return path
+        raise argparse.ArgumentTypeError(f"error:{path} is not a valid folder or file")
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--target", "-t", type=is_target_valid, required=True,
+                        help="Directory or file path which is parsed for remaining actions.")
+    parser.add_argument("--parse-only", "-p", action="store_true",
+                        help="Only parses the targeted file or folder, and prints the recognized raw actions (no remote access to Jira)")
+    parser.add_argument("--show", "-s", action="store_true",
+                        help="Similar to --parse-only, but additionaly fetches additional content from Jira and then prints a summary")
+    parser.add_argument("--interactive-update", "-i", action="store_true",
+                        help="Enables the user to interactively update his revisits/todos")
+    parser.add_argument("--user", "-u", default=None, type=str,
+                        help="Filter by username.")
+    parser.add_argument("--verbosity", "-v", default=0, type=int,
+                        help="Increases verbosity. There are three levels: 0, 1 and 2.")
+    parser.add_argument("--pudb", action="store_true",
+                        help="Launch with python debugger")
+    parser.add_argument("--debugpy", type=int,
+                        help="Launch with remote capable python debugger")
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    sys.exit(main(get_args()))

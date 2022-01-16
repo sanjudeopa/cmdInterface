@@ -1,0 +1,4 @@
+#!/bin/tcsh
+
+setenv ML_PROJECT_NAME "hunter"
+source ./setup_env

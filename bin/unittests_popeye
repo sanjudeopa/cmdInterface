@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""
+Run all unit tests in "$POPEYE/unittests".
+"""
+
+import sys
+import os
+from subprocess import check_call
+from lib_gmp.term_scroll import TermScroll
+
+def run_on_dir(term, dirname):
+    '''
+    Run all unit tests in directory dirname.
+    '''
+    skipped = 0
+    for filename in sorted(os.listdir(dirname)):
+        full_path = os.path.abspath(os.path.join(dirname, filename))
+        if os.path.isfile(full_path):
+            if not os.access(full_path, os.X_OK):
+                term.warn("Skipped [{}]".format(full_path))
+                skipped += 1
+                continue
+            term.show("Running [{}]".format(full_path), log=True)
+            check_call([full_path], cwd=dirname)
+            term.log("OK")
+    return skipped
+
+def main(argv):
+    '''
+    Run all unit tests in the directories passed as arguments.
+    Default to unittests/ if no argument.
+    '''
+    if not argv:
+        argv = [os.path.join(os.getenv("POPEYE_HOME"), "unittests")]
+
+    skipped = 0
+    with TermScroll() as term:
+        for dirname in argv:
+            skipped += run_on_dir(term, dirname)
+        if skipped != 0:
+            term.warn("Skipped {} files.".format(skipped))
+
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

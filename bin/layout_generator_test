@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+# -*- python -*-
+# vim: set syntax=python:
+
+"test programm to generate a memory layout without launching the entire Popeye/GenASM-MP generator"
+
+import random
+from time import time
+import argparse
+import cProfile
+import pstats
+from locale import getpreferredencoding
+
+import weighted_plus
+import layout_generator
+import layout_consts
+from range_object import RangeObject
+from lib_shared.popeye_common import SecuritySpace
+
+class FakeConfig:
+    "dummy object pretending to be a C{config_d} instance"
+
+    def __init__(self, **config):
+        self.config = config
+
+    def get(self, name, **kwargs):
+        "return an evaluated config item"
+
+        item = self.get_raw(name)
+        return item(**kwargs) if isinstance(item, weighted_plus.WeightedRandPlus) else item
+
+    def get_raw(self, name):
+        "return the raw config item"
+
+        return self.config[name]
+
+class FakeImpDefConst: # pylint: disable=too-few-public-methods
+    "dummy object pretending to be an instance of the C{imp_def_const}"
+
+    def __init__(self, **attributes):
+        self.__dict__.update(attributes)
+
+class Timer:
+    "timer object to record the duration of various actions"
+
+    class TimerGuard: # pylint: disable=too-few-public-methods
+        "temporary object used to record the enter/exit time of the monitored block"
+
+        def __init__(self, timer, name):
+            self.timer = timer
+            self.name = name
+            self.start = None
+
+        def __enter__(self):
+            self.start = time()
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            self.timer.add_time(self.name, self.start, time())
+
+    def __call__(self, name):
+        return self.TimerGuard(self, name)
+
+    def __init__(self):
+        self.times = []
+
+    def __iter__(self):
+        yield "{:#^40s}".format("timing")
+
+        print_table = self.times[:]
+        print_table.append(("TOTAL", sum(value for _, value in print_table)))
+        max_name_len = max(len(name) for name, _ in print_table)
+        for name, value in print_table:
+            yield "{:>{}s}: {:>6.2f} ms".format(name, max_name_len, value * 1000.)
+
+    def add_time(self, name, start, end):
+        "add another time measurement"
+
+        self.times.append((name, end - start))
+
+def get_args():
+    "parses and returns the specified command line arguments"
+
+    def auto_int(arg):
+        "helper function to parse integer command line arguments, automatically detecting decimal and hexadecimal values"
+
+        return int(arg, 0)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile",
+                        type=str,
+                        const="layout_profile.out",
+                        nargs="?")
+    parser.add_argument("--seed",
+                        type=int)
+    parser.add_argument("--verbose",
+                        action="store_true")
+    parser.add_argument("--va-randomize",
+                        action="store_true")
+    parser.add_argument("--pa-randomize",
+                        action="store_true")
+    parser.add_argument("--address",
+                        type=auto_int)
+    parser.add_argument("--translate",
+                        action="store_true")
+    parser.add_argument("--walk",
+                        action="store_true")
+    parser.add_argument("--dump-descriptor-values",
+                        action="store_true")
+    return parser.parse_args()
+
+def main(args): # pylint: disable=too-many-locals
+    "the main function to run this test"
+
+    rand_gen = random.Random()
+    if args.seed is None:
+        args.seed = rand_gen.randrange(100000000)
+    rand_gen.seed(args.seed)
+
+    print("seeding with {}".format(args.seed))
+
+    WeightedRandPlus = lambda all_options_d: weighted_plus.WeightedRandPlus( # pylint: disable=invalid-name
+            rand_gen=rand_gen,
+            default_arch=None,
+            default_tbench=None,
+            default_project=None,
+            all_options_d=all_options_d)
+
+    fake_config = FakeConfig(PAGE_SIZE=WeightedRandPlus({0x1000: 20, # 4K
+                                                         0x10000: 0,
+                                                         0x200000: 5, # 2M
+                                                         0x40000000: 1}), # 1G
+
+                             PAGE_GLOBAL=WeightedRandPlus({False: 50, True: 50}),
+
+                             MMU_HW_UPDATE=WeightedRandPlus({"OFF": 5,
+                                                             "ACCESS": 7,
+                                                             "PERMISSION": 88}),
+                             PERMISSION_WRITE_UPDATE=WeightedRandPlus({False: 10,
+                                                                       True: 90}),
+
+                             # cacheable memory
+                             CACHE_TAGS=3,
+                             CACHE_INDEXES=6,
+                             CACHE_INDEXES_SPLIT_HIGH_LOW=True,
+                             CACHE_INDEXES_SPLIT_STRIDE=100,
+                             CACHE_LINE_SECURITY=WeightedRandPlus({"S": 10,
+                                                                   "NS": 10,
+                                                                   "S_NS": 80}),
+                             CACHE_LINE_SCENARIO=WeightedRandPlus({"SOFT_COH_PRIVATE": 1,
+                                                                   "SOFT_COH_SHARED": 1,
+                                                                   "NON_COH_ANARCHY": 1,
+                                                                   "SINGLE_USAGE_PRIVATE": 10,
+                                                                   "SINGLE_USAGE_SHARED": 7,
+                                                                   "SINGLE_USAGE_ANARCHY": 6,
+                                                                   "FALSE_SHARING_PRIVATE": 15,
+                                                                   "FALSE_SHARING_PRIVATE_ANARCHY": 0,
+                                                                   "FALSE_SHARING_PRIVATE_SHARED": 0,
+                                                                   "FALSE_SHARING_SHARED_ANARCHY": 0}),
+                             CACHE_LINE_SCENARIO_GROUPING=False,
+
+                             CACHE_LINE_MAXIMUM_AGENTS=4,
+
+                             # uncacheable {non-cacheable,device} memory
+                             UNCACHE_BLOCKS_SIZE=64,
+                             UNCACHE_FRAMES=2,
+                             UNCACHE_BLOCKS=6,
+                             UNCACHE_BLOCKS_SPLIT_HIGH_LOW=True,
+                             UNCACHE_BLOCKS_SPLIT_STRIDE=100,
+                             UNCACHE_FRAMES_SECURITY=WeightedRandPlus({"S": 10,
+                                                                       "NS": 10,
+                                                                       "S_NS": 80}),
+                             UNCACHE_SCENARIO=WeightedRandPlus({"PRIVATE": 10,
+                                                                "SHARED": 6,
+                                                                "ANARCHY": 6}),
+                             UNCACHE_SCENARIO_GROUPING=False,
+                             UNCACHE_MEMORY_ATTRIBUTE=WeightedRandPlus({layout_consts.MemoryAttribute.NONCACHEABLE: 1,
+                                                                        layout_consts.MemoryAttribute.GRE: 1,
+                                                                        layout_consts.MemoryAttribute.nGRE: 1,
+                                                                        layout_consts.MemoryAttribute.nGnRE: 1,
+                                                                        layout_consts.MemoryAttribute.nGnRnE: 1}),
+
+                             # shared regions and their semaphores
+                             SHARED_REGION_COMBINE=WeightedRandPlus({"COMBINE_NONE": 1,
+                                                                     "COMBINE_SECURITY_SPACE": 1,
+                                                                     "COMBINE_MEMATTR": 1,
+                                                                     "COMBINE_SECURITY_SPACE_MEMATTR": 1}),
+                             SHARED_REGION_MAX_SIZE=234,
+                             SHARED_REGION_CHECKSUM_ENABLE=WeightedRandPlus({True: 1, False: 1}),
+                             SEMAPHORE_SIZE=WeightedRandPlus({1: 1,
+                                                              2: 1,
+                                                              4: 1,
+                                                              8: 1,
+                                                              16: 1}),
+                             SEMAPHORE_UNALIGNED=WeightedRandPlus({True: 1,
+                                                                   False: 1}),
+                             SEMAPHORE_UNALIGNED_GRANULE=16,
+                             SEMAPHORE_TYPE=WeightedRandPlus({layout_consts.OBJECT_SEMAPHORE_MUTEX: 50,
+                                                              layout_consts.OBJECT_SEMAPHORE_TICKET: 40,
+                                                              layout_consts.OBJECT_SEMAPHORE_LAMPORT: 10}),
+                             SEMAPHORE_MEMATTR_L=MemoryAttribute.get_all(),
+                             SEMAPHORE_LOW_POWER=WeightedRandPlus({False: 1, True: 1}),
+                             SEMAPHORE_LOW_POWER_NON_CACHEABLE_ALLOWED=WeightedRandPlus({False: 0, True: 1}),
+                             SEMAPHORE_LOW_POWER_NON_CACHEABLE_FORCE_SEV=False,
+                             CLEAN_INV_AT_ENTRY=WeightedRandPlus({True: 50, False: 50}),
+
+                             # mapping aliases
+                             ALIASES_NORMAL=WeightedRandPlus({0: 5,
+                                                              1: 2,
+                                                              5: 1,
+                                                              10: 1}),
+                             ALIASES_VIPT=WeightedRandPlus({0: 5,
+                                                            1: 2,
+                                                            2: 1,
+                                                            3: 1}).add_restriction([0, 1], stage=2),
+                             ALIASES_NON_COHERENT=WeightedRandPlus({0: 0,
+                                                                    1: 2,
+                                                                    2: 2,
+                                                                    3: 1}),
+                             ALIASES_NON_COHERENT_MEMORY_ATTRIBUTE=WeightedRandPlus({layout_consts.MemoryAttribute.CACHEABLE_WB: 1,
+                                                                                     layout_consts.MemoryAttribute.CACHEABLE_WT: 1,
+                                                                                     layout_consts.MemoryAttribute.NONCACHEABLE: 4,
+                                                                                     layout_consts.MemoryAttribute.GRE: 1,
+                                                                                     layout_consts.MemoryAttribute.nGRE: 1,
+                                                                                     layout_consts.MemoryAttribute.nGnRE: 1,
+                                                                                     layout_consts.MemoryAttribute.nGnRnE: 1}),
+
+                             # permissions
+                             PERMISSION_ALIASES=WeightedRandPlus({layout_consts.PERMISSION_RW_NO: 25,
+                                                                  layout_consts.PERMISSION_RO_NO: 25,
+                                                                  layout_consts.PERMISSION_RW_RW: 25,
+                                                                  layout_consts.PERMISSION_RO_RO: 25}) \
+                                                .add_restriction([layout_consts.PERMISSION_RW_RW,
+                                                                  layout_consts.PERMISSION_RO_RO], stage=2),
+
+                             # special memory objects
+                             INCREMENT_VARIABLES=3,
+                             INCREMENT_VARIABLES_SIZE=WeightedRandPlus({1: 1,
+                                                                        2: 1,
+                                                                        4: 1,
+                                                                        8: 1,
+                                                                        16: 1}),
+                             INCREMENT_VARIABLES_SECURITY_SPACE=WeightedRandPlus({SecuritySpace.S: 25,
+                                                                                  SecuritySpace.NS: 25,
+                                                                                  SecuritySpace.REALM: 25,
+                                                                                  SecuritySpace.ROOT: 25}),
+                             INCREMENT_VARIABLES_UNALIGNED=False,
+                             INCREMENT_VARIABLES_UNALIGNED_GRANULE=64,
+                             INCREMENT_VARIABLES_MEMATTR_L=MemoryAttribute.get_all(),
+
+                             RAR_INCREMENT_VARIABLES=2,
+                             RAR_INCREMENT_VARIABLES_SIZE=WeightedRandPlus({1: 1,
+                                                                            2: 1,
+                                                                            4: 1,
+                                                                            8: 1,
+                                                                            16: 1}),
+                             RAR_INCREMENT_VARIABLES_SECURITY_SPACE=WeightedRandPlus({SecuritySpace.S: 25,
+                                                                                      SecuritySpace.NS: 25,
+                                                                                      SecuritySpace.REALM: 25,
+                                                                                      SecuritySpace.ROOT: 25}),
+                             SMC_REGION_MEMATTR_L=MemoryAttribute.get_all(),
+                             NB_SMC_REGIONS=WeightedRandPlus({0: 1, 3: 1}),
+                             SMC_REGION_SECURITY_SPACE=WeightedRandPlus({SecuritySpace.S: 25,
+                                                                         SecuritySpace.NS: 25,
+                                                                         SecuritySpace.REALM: 25,
+                                                                         SecuritySpace.ROOT: 25}),
+                             RAR_INCREMENT_VARIABLES_UNALIGNED=False,
+                             RAR_INCREMENT_VARIABLES_UNALIGNED_GRANULE=64,
+                             RAR_INCREMENT_VARIABLESS_MEMATTR_L=MemoryAttribute.get_all(),
+
+                             # trickbox
+                             TRICKBOX_MAPPED=True,
+                             TRICKBOX_ADDRESS=0x13000000,
+                             TRICKBOX_SIZE=0x10000,
+                             TRICKBOX_PAGE_SIZE=0x1000,
+
+                             # peripheral port
+                             PERIPHERAL_PORT_ENABLED=True,
+                             PERIPHERAL_PORT_ADDRESS=0x15500000,
+                             PERIPHERAL_PORT_SIZE=0x100000,
+                             PERIPHERAL_PORT_PAGE_SIZE=0x1000,
+
+                             # cci configuration
+                             CCI_CONFIG_ENABLED=True,
+                             CCI_CONFIG_ADDRESS=0x15500000,
+                             CCI_CONFIG_SIZE=0x100000,
+                             CCI_CONFIG_PAGE_SIZE=0x1000,
+
+                             # genasm_mp iside
+                             ISIDE_LIB_ADDRESS=0x0,
+                             ISIDE_LIB_SIZE=0x200000,
+                             ISIDE_LIB_PAGE_SIZE=0x200000,
+
+                             ISIDE_CONST_ADDRESS=0x200000,
+                             ISIDE_CONST_SIZE=0x200000,
+                             ISIDE_CONST_PAGE_SIZE=0x200000,
+
+                             ISIDE_CACHEABLE_ADDRESS=0x400000,
+                             ISIDE_CACHEABLE_SIZE=0x200000,
+                             ISIDE_CACHEABLE_PAGE_SIZE=0x200000,
+
+                             ISIDE_DEVICE_ADDRESS=0x600000,
+                             ISIDE_DEVICE_SIZE=0x200000,
+                             ISIDE_DEVICE_PAGE_SIZE=0x200000,
+
+                             ISIDE_STACK_ADDRESS=0xa00000,
+                             ISIDE_STACK_SIZE=0x200000,
+                             ISIDE_STACK_PAGE_SIZE=0x200000,
+
+                             ISIDE_TEST_ADDRESS=0x1000000,
+                             ISIDE_TEST_SIZE=0x1000000,
+                             ISIDE_TEST_PAGE_SIZE=0x200000,
+                             ISIDE_TEST_DOUBLE_OFFSET=0x1000000,
+
+                             # SPE (statistical profiling)
+                             SPE_ENABLED=False,
+                             SPE_SIZE=WeightedRandPlus({0x400, # 1K
+                                                        0x100000}), # 1M
+                             SPE_PAGE_SIZE=0x1000,
+                             SPE_MEMORY_ATTRIBUTE=layout_consts.MemoryAttribute.CACHEABLE_WB)
+
+    fake_imp_def_const = FakeImpDefConst(L1_CACHE_SIZE_l=[64],
+                                         L1_CACHE_NB_WAY=4,
+                                         EXCLUSIVE_GRANULE=64,
+                                         CACHE_LINE_SIZE=64)
+
+    agent_names = ["CPU{}".format(i) for i in range(3)]
+
+    timer = Timer()
+
+    # instantiate the layout generator
+    layout = layout_generator.LayoutGenerator(rand_gen=rand_gen,
+                                              imp_def_const=fake_imp_def_const,
+                                              config_d=fake_config,
+                                              agent_names=agent_names)
+
+
+    with timer("creation PA"):
+
+        # generate the general physical layout
+        layout.make_pa_layout()
+
+
+    with timer("creation VA"):
+
+        # derive a few virtual layouts from it
+        layout.make_va_layout(name="CPU0_stage1_NS",
+                              stage=1,
+                              granule=12,
+                              secure=False,
+                              parent_name_non_secure=layout_consts.LAYER_PHYSICAL_NON_SECURE)
+
+        layout.make_va_layout(name="CPU0_stage1_S",
+                              stage=1,
+                              granule=12,
+                              secure=True,
+                              parent_name_secure=layout_consts.LAYER_PHYSICAL_SECURE,
+                              parent_name_non_secure=layout_consts.LAYER_PHYSICAL_NON_SECURE)
+
+        layout.make_va_layout(name="CPU1_stage2_S",
+                              stage=2,
+                              granule=12,
+                              secure=True,
+                              parent_name_secure=layout_consts.LAYER_PHYSICAL_SECURE,
+                              parent_name_non_secure=layout_consts.LAYER_PHYSICAL_NON_SECURE)
+
+        layout.make_va_layout(name="CPU1_stage2_NS",
+                              stage=2,
+                              granule=12,
+                              secure=False,
+                              parent_name_non_secure=layout_consts.LAYER_PHYSICAL_NON_SECURE)
+
+        layout.make_va_layout(name="CPU1_stage1_S",
+                              stage=1,
+                              granule=12,
+                              secure=True,
+                              parent_name_secure="CPU1_stage2_S",
+                              parent_name_non_secure="CPU1_stage2_NS")
+
+        layout.make_va_layout(name="CPU1_stage1_NS",
+                              stage=1,
+                              granule=12,
+                              secure=False,
+                              parent_name_non_secure="CPU1_stage2_NS")
+
+
+    with timer("page splitting"):
+
+        # split the preliminary pages in to real pages
+        layout.make_all_pages()
+
+
+    trickbox_start = fake_config.get("TRICKBOX_ADDRESS")
+    trickbox_end = trickbox_start + fake_config.get("TRICKBOX_SIZE")
+
+    periph_port_start = fake_config.get("PERIPHERAL_PORT_ADDRESS")
+    periph_port_end = periph_port_start + fake_config.get("PERIPHERAL_PORT_SIZE")
+
+    iside_start = fake_config.get("ISIDE_LIB_ADDRESS")
+    iside_end = fake_config.get("ISIDE_TEST_ADDRESS") + fake_config.get("ISIDE_TEST_SIZE") * 2
+
+    # reorder/ randomize the physical layer
+    allowed_range_pa = RangeObject(start=0, end=1 << 44)
+    allowed_range_pa.rem_region(iside_start, iside_end)
+    allowed_range_pa.rem_region(trickbox_start, trickbox_end)
+    allowed_range_pa.rem_region(periph_port_start, periph_port_end)
+
+
+    with timer("reordering PA"):
+
+        layout.reorder_physical_layers(randomize=args.pa_randomize, allowed_range=allowed_range_pa)
+
+
+    with timer("insert external ranges"):
+
+        # insert memory regions that require a fixed PA, but their VA layers can be randomized
+        layout.make_external_ranges()
+
+
+    # reorder/ randomize the virtual layers
+    allowed_range_va = RangeObject(start=0, end=1 << 48)
+    allowed_range_va.rem_region(iside_start, iside_end)
+    allowed_range_va.rem_region(trickbox_start, trickbox_end)
+
+
+    with timer("reordering VA"):
+
+        layout.reorder_virtual_layers(randomize=args.va_randomize, allowed_range=allowed_range_va)
+
+
+    with timer("insert flat mapped"):
+
+        # insert memory regions thare require a fixed PA and should be flat mapped in all VA layers
+        layout.make_flat_ranges()
+
+
+    with timer("mapping"):
+
+        # generate the page tables for all virtual layouts
+        layout.make_mapping()
+
+
+
+    va = args.address
+    layer = layout["CPU1_stage1_NS"]
+
+    # if enabled, do some translations
+    if args.translate:
+        with timer("translation layout (x 1000)"):
+            try:
+                for _ in range(1000):
+                    security_space_1, pa_1 = layer.get_address_lowest(va, layout_based=True)
+            except (ValueError, layout_consts.TranslationError):
+                security_space_1, pa_1 = None, None
+        if pa_1 is None:
+            print("translation {:#x}: failed".format(va))
+        else:
+            print("translation {:#x}: {:#x}:{:s}".format(va, pa_1, str(security_space_1)))
+
+
+        with timer("translation pages (x 1000)"):
+            try:
+                for _ in range(1000):
+                    security_space_2, pa_2 = layer.get_address_lowest(va, layout_based=False)
+            except (ValueError, layout_consts.TranslationError):
+                security_space_2, pa_2 = None, None
+        if pa_2 is None:
+            print("translation {:#x}: failed".format(va))
+        else:
+            print("translation {:#x}: {:#x}:{:s}".format(va, pa_2, str(security_space_2)))
+
+
+    # if enabled, do some table walks
+    if args.walk:
+        with timer("translation walk (x 1000)"):
+            try:
+                for _ in range(1000):
+                    walk = layer.get_address_walk(va)
+            except (ValueError, layout_consts.TranslationError):
+                walk = None
+        if walk is None:
+            print("walk {:#x}: failed".format(va))
+        else:
+            print("walk {:#x}: {:s}".format(va, ", ".join("{:#x}:{:s}".format(addr, str(security_space)) for security_space, addr in walk)))
+
+        with timer("translation recursive walk (x 1000)"):
+            try:
+                for _ in range(1000):
+                    walk = layer.get_address_walk(va, recursive=True)
+            except (ValueError, layout_consts.TranslationError):
+                walk = None
+        if walk is None:
+            print("walk {:#x}: failed".format(va))
+        else:
+            print("walk {:#x}: {:s}".format(va, ", ".join("{:#x}:{:s}".format(addr, str(security_space)) for security_space, addr in walk)))
+
+
+    # print out some results
+    encoding = getpreferredencoding()
+    def print_lines(lines):
+        "iterate over all lines, encode them in the preferred encoding, and print them on stdout"
+
+        for line in lines:
+            print(line.encode(encoding, errors="replace"))
+
+    for layer_name in layout.get_virtual_layers():
+        print("{:#^40s}".format(layer_name))
+        print_lines(layout[layer_name].dump_lines(args.verbose))
+
+    print("{:#^40s}".format(layout_consts.LAYER_PHYSICAL_SECURE))
+    print_lines(layout[layout_consts.LAYER_PHYSICAL_SECURE].get_usage().dump_lines())
+
+    print("{:#^40s}".format(layout_consts.LAYER_PHYSICAL_NON_SECURE))
+    print_lines(layout[layout_consts.LAYER_PHYSICAL_NON_SECURE].get_usage().dump_lines())
+
+    descriptors_secure, descriptors_non_secure = layout.dump_descriptor_values()
+
+    def print_descriptors(descriptors):
+        "iterate over all descriptors and print them if they are valid"
+
+        for address in sorted(descriptors):
+            descriptor_value = descriptors[address]
+            if descriptor_value:
+                print("{:#018x}: {:#018x}".format(address, descriptor_value))
+
+    if args.dump_descriptor_values:
+        print("{:#^40s}".format("descriptors secure"))
+        print_descriptors(descriptors_secure)
+
+        print("{:#^40s}".format("descriptors non-secure"))
+        print_descriptors(descriptors_non_secure)
+
+    print_lines(timer)
+
+def run():
+    "a small wrapper function around L{main} in order to be able to profile it"
+
+    args = get_args()
+    if args.profile:
+        cProfile.runctx("exit(main(args))", globals(), locals(), args.profile, "tottime")
+        pstats.Stats(args.profile).sort_stats("cumtime").print_stats()
+    else:
+        exit(main(args))
+
+if __name__ == "__main__":
+    run()

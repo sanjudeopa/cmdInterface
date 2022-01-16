@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+
+'''Create a package containing all files to build and run simulations in standalone environment.'''
+
+import ast
+import argparse
+import os
+import sys
+import shutil
+import fnmatch
+import tempfile
+import time
+import subprocess
+import re
+import datetime
+import json
+from logging import basicConfig
+
+from lib_shared.const_log import getStdoutLogger
+from lib_shared.popeye_common import os_tag
+
+LOGGER = getStdoutLogger()
+
+BUILD_CMD_REGEXES = {
+        'vcs': [
+                r'Executing.* (vlogan .*)]',
+                r'Executing.* (vcs .*)]',
+        ],
+        'mti': [
+                r'Executing.* (vlib .*)]',
+                r'Executing.* (vmap .*)]',
+                r'Executing.* (vlog .*)]',
+                r'Executing.* (vopt .*)]',
+        ]
+}
+SIM_CMD_REGEXES = {
+        'vcs': [
+                r'Executing.* (\./bin.*)]',
+        ],
+        'mti': [
+                r'Executing.* (vmap .*)]',
+                r'Executing.* (vsim .*)]',
+        ]
+}
+
+
+def match_patterns(*patterns):
+    '''Function that can be used as copytree() match parameter.
+
+    Patterns is a sequence of glob-style patterns
+    that are used to include files'''
+    def _match_patterns(names):
+        '''Implementation of the function.'''
+        matched_names = []
+        for pattern in patterns:
+            matched_names.extend(fnmatch.filter(names, pattern))
+        return set(matched_names)
+    return _match_patterns
+
+
+def copytree(src, dst, symlinks=False, ignore=None, match=None):
+    '''Copy recursively an entire directory.
+
+    This function has been duplicated from shutils, adding possibility to
+    give match patterns in order to only include specific files.
+    '''
+    names = os.listdir(src)
+    if ignore is not None:
+        ignored_names = ignore(src, names)
+    else:
+        ignored_names = set()
+
+    if match is not None:
+        matched_names = match(names)
+
+    if not os.path.exists(dst):
+        os.makedirs(dst)
+
+    errors = []
+    for name in names:
+        if name in ignored_names:
+            continue
+        srcname = os.path.join(src, name)
+        dstname = os.path.join(dst, name)
+        try:
+            if symlinks and os.path.islink(srcname):
+                linkto = os.readlink(srcname)
+                os.symlink(linkto, dstname)
+            elif os.path.isdir(srcname):
+                copytree(srcname, dstname, symlinks, ignore, match)
+            elif match is None or name in matched_names or '.' not in name:
+                if os.path.exists(srcname):
+                    shutil.copy2(srcname, dstname)
+        # catch the Error from the recursive copytree so that we can
+        # continue with other files
+        except shutil.Error as err:
+            errors.extend(err.args[0])
+        except (IOError, os.error) as why:
+            errors.append((srcname, dstname, str(why)))
+    try:
+        shutil.copystat(src, dst)
+    except OSError as why:
+        errors.extend((src, dst, str(why)))
+    if errors:
+        raise shutil.Error(errors)
+
+
+def parse_args():
+    '''Parse command-line arguments.'''
+    parser = argparse.ArgumentParser('Launch Popeye packager')
+
+    parser.add_argument('-i', '--in', dest='in_dirs', type=str, nargs='+', required=True,
+                        help='Directory containing simulations, build directories if --build-only is set')
+
+    parser.add_argument('-o', '--out', dest='output_file', type=str,
+                        help='Generated package file, default name is popeye_pkg_<YYYY><MM><DD>')
+
+    parser.add_argument('-b', '--build-only', dest='build_dirs_only', action='store_true',
+                        help='--in refers to compilation directories instead of simulation directories')
+
+    parser.add_argument('-f', '--force', dest='force', action='store_true',
+                        help='Overwrite package file if it already exists')
+
+    parser.add_argument('-n', '--no-archive', dest='no_archive', action='store_true',
+                        help='Do not archive the package directory')
+
+    parser.add_argument('-d', '--temp_root_dir', dest='temp_root_dir', type=str,
+                        help='If specified, use given directory as temporary directory otherwise use /tmp')
+
+    parser.add_argument('-v', '--verbose', dest='verbose_level', type=int, default=0,
+                        help='Verbosity level')
+
+    return parser.parse_args()
+
+
+def file_replace_pattern(name, old_pattern, new_pattern):
+    '''Replace string pattern in file.'''
+    with open(name, 'r') as fin:
+        filedata = fin.read()
+
+    filedata = filedata.replace(old_pattern, new_pattern)
+
+    with open(name, 'w') as fout:
+        filedata = fout.write(filedata)
+
+def module_to_env(modulefile, cwd, ld_library_path_prepends=None, single_value_keys=None):
+    '''
+    Return a string composed of bash commands to set the environment according to input module file.
+    Also remove irrelevant variables and absolute paths.
+    single_value_keys: list of environment variables that *must* contain only one value, use of colon is forbidden
+    '''
+    init_env_d = ast.literal_eval(subprocess.check_output(['bash',
+                                                           '-c',
+                                                           '. /arm/tools/setup/init/sh && python -c "import os; print(dict(os.environ))"'],
+                                                          env={},
+                                                          universal_newlines=True))
+
+    module_env_d = ast.literal_eval(subprocess.check_output(['bash',
+                                                             '-c',
+                                                             '. /arm/tools/setup/init/sh && module load {} && python -c "import os; print(dict(os.environ))"'
+                                                             .format(modulefile)],
+                                                            env={},
+                                                            cwd=cwd,
+                                                            universal_newlines=True))
+
+    if ld_library_path_prepends is None:
+        ld_library_path_prepends = ()
+    diff_env_d = {}
+    for var, value in module_env_d.items():
+        if var in init_env_d:
+            if value != init_env_d[var]:
+                diff_env_d[var] = value.replace(init_env_d[var], '')
+        else:
+            diff_env_d[var] = value
+
+    ignore_vars = {'modshare', 'LICENSE', 'LMFILES', 'LOADEDMODULES', 'TURBO_LIBS', # Arm-specific
+                   'NOVAS', 'VCS', 'VERDI3_SC_BETA', # VCS-specific
+                   'QUESTASIM_VERSION', 'MTI_VCO_MODE'} # MTI-specific
+
+    final_env_d = {}
+    for var, value in diff_env_d.items():
+        # Remove irrelevant keys
+        if any(substr in var for substr in ignore_vars):
+            continue
+
+        # Only keep relative paths
+        relative_paths = [path for path in value.split(os.pathsep) if path and not os.path.isabs(path)]
+
+        if relative_paths:
+            final_env_d[var] = os.pathsep.join(relative_paths)
+
+    for prepend in ld_library_path_prepends:
+        final_env_d["LD_LIBRARY_PATH"] = "{}:{}".format(prepend, final_env_d["LD_LIBRARY_PATH"])
+
+    if single_value_keys is None:
+        single_value_keys = ()
+
+    return "\n".join(('export "{}={}{}"'.format(k, v, "" if k in single_value_keys else ":${%s}" % k)) for k, v in final_env_d.items())
+
+def create_build_script(temp_package_dir,
+                        temp_build_dir,
+                        build_dir,
+                        build_name,
+                        simulator):
+    '''Create executable bash script to build TB.'''
+    build_commands = extract_commands(os.path.join(build_dir, 'compile.log'),
+                                      BUILD_CMD_REGEXES[simulator],
+                                      build_dir,
+                                      build_name)
+
+    if os.getenv('KLEIN_HOME') is not None:
+        project_home = "KLEIN_HOME"
+        project_path = "../klein"
+    elif os.getenv('MTH_HOME') is not None:
+        project_home = "MTH_HOME"
+        project_path = "../mth"
+    elif os.getenv('HUNTER_HOME') is not None:
+        project_home = "HUNTER_HOME"
+        project_path = "../hunter"
+    elif os.getenv('GRIFFIN_HOME') is not None:
+        project_home = "GRIFFIN_HOME"
+        project_path = "../griffin"
+    elif os.getenv('HAYES_HOME') is not None:
+        project_home = "HAYES_HOME"
+        project_path = "../hayes"
+    elif os.getenv('SENJO_HOME') is not None:
+        project_home = "SENJO_HOME"
+        project_path = "../senjo"
+    elif os.getenv('BLUERIDGE_HOME') is not None:
+        project_home = "BLUERIDGE_HOME"
+        project_path = "../blueridge"
+    else:
+        raise RuntimeError("Please check if project home env variable is set.")
+
+    build_script = '''#!/usr/bin/env bash
+
+set -ex
+
+cd {0}
+mkdir -p libraries
+{1}
+export LD_LIBRARY_PATH="$LD_LIBRARY_PATH":tools_build/lib_popeye_parser
+export POPEYE_HOME="$PWD"
+export CORINTH_SRC=theodul
+export CORINTH_HOME="$CORINTH_SRC/shared"
+export VIP5_SV_HOME="$CORINTH_HOME/logical/vip5/sv"
+export VIP_CLK_RESET_SV_HOME="$CORINTH_HOME/logical/vip_clk_reset/sv"
+export VIP_AXI_ACE5_SV_HOME="$CORINTH_HOME/logical/axi_ace5/sv"
+export VIP_SYSCO_SV_HOME="$CORINTH_HOME/logical/vip_sysco/sv"
+export VIP_CHIE_LIKE_SPECLCRDV_HOME="$CORINTH_HOME/logical/vip5/arm_internal/chie_like/vip_chi5e_like_speclcrdv_pkg"
+export VIP_CHIE_LITE_CORINTH_BRIDGE="$CORINTH_HOME/logical/vip5/arm_internal/chie_like/vip_chi5e_corinth_bridge"
+export VIP4_DIR="$CORINTH_HOME/logical/vip4"
+export APB_UVC_DIR="$CORINTH_HOME/logical/vip4/uvc/apb4"
+export VIP_APB5_SV_HOME="$CORINTH_HOME/../shared/logical/apb5/sv"
+export VIP_AXI_STREAM_SV_HOME="$POPEYE_HOME/lib/vip/axi4stream/sv"
+export VIP_LIB_SV_HOME="$POPEYE_HOME/lib/vip/shared_lib/sv"
+{2}
+export MAIN_PROJECT_HOME={3}
+{4}'''.format('../build_dirs/{}'.format(build_name),
+              module_to_env('./modulefiles/blk_compile.module', temp_build_dir, single_value_keys=['UNIVENT_PATH']),
+              "export {}={}".format(project_home, project_path),
+              project_path.replace("../", ""),
+              build_commands)
+
+    dump_script(os.path.join(temp_package_dir, 'build_scripts'),
+                'build_{}.sh'.format(build_name),
+                build_script)
+
+def import_build_dir(temp_package_dir,
+                     build_dir,
+                     build_name,
+                     simulator):
+    '''Copy files from build directory and dependencies into the package.'''
+    LOGGER.info('Importing files from build directory: %s', build_dir)
+    temp_build_dir = os.path.join(temp_package_dir, 'build_dirs', build_name)
+    copytree(build_dir,
+             temp_build_dir,
+             ignore=shutil.ignore_patterns('.git', '.svn', '*.old.*',
+                                           'mini_tb', 'A32', 'A64', 'v8VAL', 'ris', 'tbench_top',
+                                           'formal_verif',
+                                           'implementation*',
+                                           'gic600',
+                                           'libraries', 'blackbox', 'greybox', 'whitebox', # blkval-specific (contains pre-compiled objects)
+                                           'partcompdir', '*.daidir'), # VCS-specific: files generated during (incremental) compilation
+             match=match_patterns('*.v', '*.sv', '*.svh', '*.vc',
+                                  '*.c', '*.cpp', '*.h', '*.so', '*.mk',
+                                  '*.module',
+                                  '*.py',
+                                  '*.json', '*.plitab', '.touched', '*.db', '*.sdb', 'synopsys_sim.setup')) # VCS-specific
+
+    # Update path of build directory in build files
+    file_replace_pattern(os.path.join(temp_build_dir, 'modulefiles/blk_compile.module'), build_dir, '.')
+    file_replace_pattern(os.path.join(temp_build_dir, 'modulefiles/blk_compile.module'), os.getcwd(), '.')
+    file_replace_pattern(os.path.join(temp_build_dir, 'modulefiles/for_blk_val.module'), build_dir, '../../build_dirs/{}'.format(build_name))
+    file_replace_pattern(os.path.join(temp_build_dir, 'modulefiles/for_blk_val.module'), os.getcwd(), '../../build_dirs/{}'.format(build_name))
+
+    if simulator == 'vcs':
+        file_replace_pattern(os.path.join(temp_build_dir, 'synopsys_sim.setup'), build_dir, '.')
+
+    # Getting the univent path
+    univent_home = subprocess.run(["univent_env", "--print", "root"],
+                                  capture_output=True, check=True, text=True).stdout
+    univent_local = univent_home.replace("/arm/", "./")
+    # Copying univent libs
+    copytree(univent_home, os.path.join(temp_build_dir, univent_local))
+
+    # Copy modules directory and update univent path
+    copytree('modules', os.path.join(temp_build_dir, 'modules'))
+
+    # Replacing univent module contents
+    with open(os.path.join(temp_build_dir, 'modules/univent.module'), 'w') as file_handle:
+        file_handle.write(f"#%Module\nsetenv UNIVENT_PATH {univent_local}")
+
+    # Create script to build the TB
+    create_build_script(temp_package_dir,
+                        temp_build_dir,
+                        build_dir,
+                        build_name,
+                        simulator)
+
+
+def create_sim_script(temp_package_dir,
+                      temp_sim_dir,
+                      build_dir,
+                      build_name,
+                      sim_dir,
+                      sim_dir_leaf,
+                      simulator):
+    '''Create executable bash script to run the simulation.'''
+
+    sim_commands = extract_commands(os.path.join(sim_dir, 'blk_val.log'),
+                                    SIM_CMD_REGEXES[simulator],
+                                    build_dir,
+                                    build_name)
+
+    # Popeye parser needs a shared object from G++ lib
+    ld_lib_path_prepends = ("../../build_dirs/{}/warehouse/gcc_lib".format(build_name),)
+    sim_script = '''#!/usr/bin/env bash
+
+set -ex
+
+cd {0}
+{1}
+export LD_LIBRARY_PATH="$LD_LIBRARY_PATH":.
+export PATH="$PATH":"../../build_dirs/{2}/bin"
+{3}'''.format('../sim_dirs/{}'.format(sim_dir_leaf), module_to_env('./modulefiles/blk_val.module',
+                                                                   temp_sim_dir,
+                                                                   ld_lib_path_prepends),
+              build_name, sim_commands)
+
+    dump_script(os.path.join(temp_package_dir, 'sim_scripts'),
+                'sim_{}.sh'.format(sim_dir_leaf),
+                sim_script)
+
+def import_sim_dir(temp_package_dir,
+                   build_dir,
+                   build_name,
+                   sim_dir,
+                   simulator,
+                   body_nb_clk):
+    '''Copy files from simulation directory into the package and update symbolic links.'''
+    sim_dir_leaf = sim_dir.rstrip('/').split('/')[-1]
+    LOGGER.info('Importing files from simulation directory: %s', sim_dir)
+    temp_sim_dir = os.path.join(temp_package_dir, 'sim_dirs', sim_dir_leaf)
+    copytree(sim_dir,
+             temp_sim_dir,
+             ignore=shutil.ignore_patterns('*.evs', '*.sqlite'),
+             symlinks=True)
+
+    # Create link for warehouse tools
+    os.symlink('../../build_dirs/{}/warehouse'.format(build_name), os.path.join(temp_sim_dir, 'warehouse'))
+
+    # Update path of build directory in sim files
+    file_replace_pattern(os.path.join(temp_sim_dir, 'modulefiles/blk_val.module'), build_dir, '../../build_dirs/{}'.format(build_name))
+
+    # Get gcc shared objects for lib_popeye_parser
+    copytree('/arm/tools/gnu/gcc/9.3.0/{}-x86_64/lib64/'.format(os_tag()),
+             '{}/../../build_dirs/{}/warehouse/gcc_lib'.format(temp_sim_dir, build_name))
+
+    # Update symlinks
+    for root, dirs, files in os.walk(temp_sim_dir):
+        for name in dirs + files:
+            full_name = os.path.join(root, name)
+            if os.path.islink(full_name):
+                link = os.readlink(full_name)
+                if build_dir in link:
+                    link = re.sub(build_dir, '../../build_dirs/{}'.format(build_dir.split('/')[-1]), link)
+                    os.unlink(full_name)
+                    os.symlink(link, full_name)
+
+    # Create script to run simulation
+    create_sim_script(temp_package_dir,
+                      temp_sim_dir,
+                      build_dir,
+                      build_name,
+                      sim_dir,
+                      sim_dir_leaf,
+                      simulator)
+
+    # Modify plusargs.vc to have the correct body_nb_clk
+    plusargs = []
+    with open(os.path.join(temp_sim_dir, 'plusargs.vc'), 'r') as fin:
+        for line in fin.read().splitlines():
+            if any(overriden_plusarg in line for overriden_plusarg in ("SIMU_RUN_TIME_STOP", "SIMU_NB_CLK_STOP_MIN", "SIMU_NB_CLK_STOP")):
+                pass
+            else:
+                plusargs.append(line)
+
+    plusargs.extend(["+SIMU_RUN_TIME_STOP=0",
+                     "+SIMU_NB_CLK_STOP_MIN=0",
+                     "+SIMU_NB_CLK_STOP={}".format(body_nb_clk)])
+
+    with open(os.path.join(temp_sim_dir, 'plusargs.vc'), 'w') as fout:
+        fout.write("\n".join(plusargs))
+
+def dump_readme(temp_package_dir, build_only):
+    '''Dump README file containing instructions to use the package.'''
+    with open(os.path.join(temp_package_dir, 'README'), 'w') as fout:
+        fout.write('''\
+Required tools:
+* OS: rhe7-x86_64
+* Python: 3.8.2
+* GCC: 9.3.0
+* Appropriate version of the simulator
+
+How to build the TB:
+* Go in build_scripts/
+* Execute build_*.sh scripts, one script per build configuration.
+{0}'''.format('' if build_only else '''
+How to run the simulations:
+* Go in sim_scripts/
+* Execute sim_*.sh scripts, one script per test.'''))
+
+def extract_commands(filename, regexes, build_dir, build_name):
+    """
+    Extract command which match L{regexes} in L{filename}, replacing
+    absolute path L{build_dir} with relative path L{build_name}.
+    """
+    commands = []
+    regexes_matched = set()
+
+    with open(filename) as fh:
+        for line in fh:
+            for regex in regexes:
+                if re.match(regex, line):
+                    command = re.split(regex, line)[1].replace(build_dir, '../../build_dirs/{}'.format(build_name))
+                    commands.append(command)
+                    regexes_matched.add(regex)
+
+    regexes_unmatched = set(regexes) - regexes_matched
+    if regexes_unmatched:
+        raise RuntimeError("{} regexes was not found in {}".format(regexes_unmatched, filename))
+
+    return "\n".join(commands)
+
+def dump_script(scripts_dir, script_name, script_content):
+    '''Dump script content in file and make it executable'''
+    if not os.path.exists(scripts_dir):
+        os.makedirs(scripts_dir)
+
+    script_path = os.path.join(scripts_dir, script_name)
+
+    with open(script_path, 'w') as fout:
+        fout.write(script_content)
+
+    os.chmod(script_path, 0o750)
+
+def main(args): # pylint: disable=too-many-statements
+    '''Main function.'''
+    if args.verbose_level > 0:
+        basicConfig(level=max(10 - args.verbose_level, 0))
+
+    packaging_time = -time.time()
+
+    if args.output_file:
+        output_dir_file = args.output_file
+    else:
+        now = datetime.datetime.now()
+        output_dir_file = 'popeye_pkg_{:04d}_{:02d}_{:02d}'.format(now.year, now.month, now.day)
+
+    output_file = '{}.tar.gz'.format(output_dir_file)
+
+    if not args.force:
+        if args.no_archive:
+            assert not os.path.exists(output_dir_file), 'Package file {} exists, please remove it manually.'.format(output_dir_file)
+        else:
+            assert not os.path.exists(output_file), 'Archive file {} exists, please remove it manually.'.format(output_file)
+
+    temp_root_dir = tempfile.mkdtemp(dir=args.temp_root_dir)
+    LOGGER.info('Created temporary directory: %s', temp_root_dir)
+
+    temp_package_dir = os.path.join(temp_root_dir, output_dir_file)
+
+    build_dirs_already_imported = set()
+
+    try:
+        for in_dir in args.in_dirs:
+            # Retrieve build directory
+            with open(os.path.join(in_dir, 'compile.json' if args.build_dirs_only else 'stats.json'), 'r') as stats_fd:
+                stats = json.load(stats_fd)
+            build_dir = os.path.normpath(stats['global']['build_directory'])
+            build_name = build_dir.split('/')[-1]
+            simulator = stats['global']['simulator_str']
+            body_nb_clk = None if args.build_dirs_only else stats['global']['body_nb_clk']
+            if body_nb_clk is None:
+                body_nb_clk = 0
+
+            # Import build directory
+            if build_dir not in build_dirs_already_imported:
+                import_build_dir(temp_package_dir,
+                                 build_dir,
+                                 build_name,
+                                 simulator)
+
+                build_dirs_already_imported.add(build_dir)
+
+            if not args.build_dirs_only:
+                # Import simulation directory
+                import_sim_dir(temp_package_dir,
+                               build_dir,
+                               build_name,
+                               in_dir,
+                               simulator,
+                               body_nb_clk)
+
+        dump_readme(temp_package_dir, args.build_dirs_only)
+
+        if args.no_archive:
+            if args.force and os.path.exists(output_dir_file):
+                shutil.rmtree(output_dir_file)
+
+            shutil.move(temp_package_dir, output_dir_file)
+            LOGGER.info('Package created: %s', output_dir_file)
+        else:
+            if args.force and os.path.exists(output_file):
+                os.remove(output_file)
+
+            LOGGER.info('Archiving directory: %s', output_dir_file)
+            name = shutil.make_archive(output_dir_file, 'gztar', temp_root_dir)
+            LOGGER.info('Archived package created: %s', name)
+
+        LOGGER.info('Removing temporary directory: %s', temp_root_dir)
+        shutil.rmtree(temp_root_dir)
+
+    except (KeyboardInterrupt, Exception):
+        LOGGER.info('Caught exception, removing directory: %s', temp_root_dir)
+        shutil.rmtree(temp_root_dir)
+        raise
+
+    packaging_time += time.time()
+
+    LOGGER.info('Packaging complete in %d s.', packaging_time)
+
+    return 0
+
+if __name__ == '__main__':
+    arguments = parse_args()
+    sys.exit(main(arguments))

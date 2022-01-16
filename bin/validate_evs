@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+'''
+Run the assertion set built in smart events to validate an incoming Univent 4
+event stream.
+
+Exit on the first error.
+'''
+
+import sys
+import time
+import argparse
+
+from evs import BinaryStreamReader
+from lib_checkers import smart_events
+from lib_shared.popeye_common import open_retry
+
+def validate(evs, retry=False, dryrun=False):
+    '''
+    Validate .evs files with assertion set in popeye_checker.
+
+    dryrun -- boolean, optional
+        If dryrun is True, disable the assertions.
+        Used to benchmark the overhead introduced by running the assertions.
+    '''
+    smart_events.common.SBNode.validate_events = not dryrun
+
+    total_events = 0
+    with (open_retry if retry else open)(evs) as fh:
+        for event in BinaryStreamReader(fh, classes=smart_events.CLASSES):
+            if not dryrun:
+                smart_events.common.validate_props(event)
+            total_events += 1
+
+    return total_events
+
+def main(argv):
+    '''
+    Parse command-line arguments and validate streams.
+
+    args -- list of strings.
+        Command line arguments to parse.
+    '''
+    parser = argparse.ArgumentParser(prog='validate_evs',
+                                     description=__doc__)
+
+    parser.add_argument("-i", dest="evs", default=None)
+    parser.add_argument("-I", dest="retry_evs", default=None)
+
+    parser.add_argument('--benchmark', '-b',
+                        action='store_true',
+                        default=False,
+                        help='Run a second time with assertions disabled.')
+
+    args = parser.parse_args(argv)
+
+    assert (args.evs is None) != (args.retry_evs is None)
+    retry = args.retry_evs is not None
+    evs = args.evs if args.retry_evs is None else args.retry_evs
+
+    start = time.time()
+    total = validate(evs, retry=retry)
+    duration = time.time() - start
+    print('Checked {} events in {:4.2f} s'.format(total, duration))
+
+    if args.benchmark:
+        start = time.time()
+        total = validate(evs, retry=retry, dryrun=True)
+        duration = time.time() - start
+        print('Dry run {} events in {:4.2f} s'.format(total, duration))
+
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

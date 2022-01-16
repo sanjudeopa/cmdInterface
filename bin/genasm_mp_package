@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""
+Create archive containing files related to a test
+
+By default, gather files needed for test reproduction on fastsim
+"""
+
+import os
+import glob
+import tarfile
+import argparse
+
+from lib_gmp.test_history import get_last_test_name
+
+class TestPackager:
+    "Class handling collection and write of tar.gz archive"
+
+    def __init__(self, popeye_path, sub_dir, test_name, archive_path):
+        self.popeye_path = popeye_path
+        self.test_path = os.path.join(popeye_path, sub_dir, "tests", test_name)
+        self.test_name = test_name
+        self.archive_path = archive_path
+
+        self.files = {}
+
+        self.temp_file = None
+
+    def add_files_glob(self, glob_file):
+        "Search for glob_file and add them to the archive"
+        glob_path = os.path.join(self.test_path, glob_file)
+        for file_name in glob.glob(glob_path):
+            self.files[os.path.basename(file_name)] = file_name
+
+    def write_archive(self, verbose):
+        "Write the tar.gz archive"
+        with tarfile.open(self.archive_path, "w:gz") as package_fd:
+            for archive_file_name, file_name in self.files.items():
+                if verbose:
+                    print(f"Collected {archive_file_name}")
+                package_fd.add(file_name, os.path.join(self.test_name, archive_file_name))
+
+        if verbose:
+            print(f"Written {self.archive_path}")
+
+    def clean_up(self):
+        "Remove the temporary file if it was created"
+        if self.temp_file is not None and os.path.exists(self.temp_file):
+            os.remove(self.temp_file)
+
+def main(args):
+    """
+    @param args: named tuple with command line arguments
+    """
+    test_name = args.name or get_last_test_name(args.dir)
+
+    test_packager = TestPackager(
+            popeye_path=os.environ.get("POPEYE_HOME"),
+            sub_dir=args.dir,
+            test_name=test_name,
+            archive_path=args.file or f"{test_name}.tar.gz",
+    )
+
+    for glob_file in args.what:
+        test_packager.add_files_glob(glob_file)
+
+    test_packager.write_archive(args.verbose)
+    test_packager.clean_up()
+
+def get_args():
+    """
+    helper function to instantiate an L{ArgumentParser}
+
+    @return: a L{namedtuple} instance containing the parsed command line options
+    """
+    parser = argparse.ArgumentParser(
+            description="Create archive containing related to a test (by default, files needed for fastsim reproduction)",
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument("name", nargs="?", help="Name of test to package. If none given, use last generated test")
+    parser.add_argument("--dir", default="genasm_mp", help="Subdirectory containing all generated files")
+    parser.add_argument(
+            "--what",
+            nargs="+",
+            help="List of test files to include",
+            default=["*.ELF", "test.map", "mte_init.*.json", "fastsim_loopback.json", "fastsim.sh", "load_file_*"],
+    )
+    parser.add_argument("-f", "--file", help="Archive file. If none given, write archive in current directory")
+    parser.add_argument("-v", "--verbose", action="store_true")
+
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    main(get_args())

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+main () {
+    if ! command -v module >/dev/null 2>&1; then
+        . /arm/tools/setup/lib/sh
+    fi
+
+    if [[ "${POPEYE_USE_VENV}" == true ]]; then
+        python3 -m pip install -r "${POPEYE_HOME:?}/requirements/codecheck.txt"
+    else
+        module load "${POPEYE_HOME}/modules/codecheck.module"
+    fi
+
+    mypy --config-file "${POPEYE_HOME}/tools/infra/mypy/setup.cfg" "${POPEYE_HOME}/tools"
+}
+
+main "$@"

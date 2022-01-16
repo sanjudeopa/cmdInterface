@@ -1,0 +1,33 @@
+#!/bin/bash
+
+if [[ -z $DEPOT_VERSION ]] ; then
+  #source this if it hasnt been sourced already
+  source /arm/tools/setup/init/bash
+fi
+
+# Figure out POPEYE_HOME
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+export POPEYE_HOME=${SCRIPT_DIR}/../..
+
+source "${POPEYE_HOME}"/bin/machine_learning/shared_setup
+
+export DORY_WORK=${POPEYE_HOME}/dory_work
+mkdir -p "$DORY_WORK"
+
+echo "ML_PROJECT_NAME=${ML_PROJECT_NAME}"
+echo "POPEYE_HOME=${POPEYE_HOME}"
+echo "DORY_WORK=${DORY_WORK}"
+
+if [ -z "${PYTHONPATH}" ]; then
+  export PYTHONPATH="${POPEYE_HOME}/bin/machine_learning:${POPEYE_HOME}/bin/machine_learning/popeye_ml"
+else
+  export PYTHONPATH="${POPEYE_HOME}/bin/machine_learning:${PYTHONPATH}:${POPEYE_HOME}/bin/machine_learning/popeye_ml"
+
+fi
+
+export ML_HOME="${POPEYE_HOME}/bin/machine_learning"
+
+export PATH="${POPEYE_HOME}/bin:${PATH}"
+
+PROJECT="$( "${ML_HOME}"/popeye_ml/project_specific.py )"
+export LSB_DEFAULTPROJECT=${PROJECT}

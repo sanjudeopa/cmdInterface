@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+
+# pylint: disable=missing-docstring
+# pylint: disable=invalid-name
+# pylint: disable=too-many-statements
+# pylint: disable=too-many-branches
+
+import os
+import re
+import sys
+import json
+import time
+import random
+import argparse
+import subprocess
+import tempfile
+from pathlib import Path
+
+from lib_gmp.term_scroll import TermScroll
+from lib_gmp.regr_result import RegrResult
+from lib_gmp.gmp_consts import PROJECTS, RUN_PROJECTS, get_project_run_alias, MAX_NB_CPUS
+from lib_gmp.versioning import get_lsf_os_resources
+from lib_gmp.manifests import fetch_manifest_to_dir, get_component_revisions_from_manifest, are_manifest_components_available
+from lib_gmp.regr_list_parser import ConfigListParser
+from lib_gmp.upload_eap import RegressionSchema, UploadSkippedException
+from lib_gmp.libs_compile import compile_libs
+from lib_shared.config_requirements import get_default_requirements
+
+def reset_env(ts, subdir, minitb, minitb_dir):
+    ts.show("Resetting GenASM-MP directories environment...", log=True)
+
+    command = ["genasm_mp", "--resetenv", "--dir", subdir]
+    if minitb:
+        assert minitb_dir, "mini_tb directory has not been set"
+        command.append("--minitb_dir")
+        command.append(minitb_dir)
+
+    ts.log(" ".join(command))
+    with subprocess.Popen(command) as p:
+        return p.wait()
+
+def execute(ts, commands, lsfproject, lsfqueue):
+    bsub_args = ["bsub",
+                 "-I",
+                 "-sp", "90",
+                 "-R", "{0:s} rusage[mem=1024]".format(get_lsf_os_resources()),
+                 "-W", "5",
+                 "-P", lsfproject,
+                 "-q", lsfqueue,
+                 "-Jd", "top_val-PD-risgen_genasm", # required for "green" flow classification
+                 "-g", "/cpg/{0:s}/sim/top/ris/genasm-mp/reset".format(lsfproject.lower())]
+
+    for i, command in enumerate(commands):
+        if i:
+            bsub_args.append("&&")
+        bsub_args.extend(command)
+    ts.log(" ".join(bsub_args))
+    with subprocess.Popen(bsub_args) as p:
+        return p.wait()
+
+def reset(ts, args, popeye_path):
+    """
+    Prepare the regression environment by running a platform checker job,
+    compiling the support libraries and the generator code
+    """
+
+    if args.fastsim and args.run_platform_check:
+        if reset_env(ts, args.dir, args.minitb, args.minitb_dir):
+            return True
+
+        ts.show("Performing platform_checker test...", log=True)
+
+        platform_check_cmd = ["genasm_mp", "--configs", "platform_checker"]
+        platform_check_cmd += get_test_args(args, False, popeye_path)
+        if args.project_core:
+            platform_check_cmd.append("--project_core")
+            platform_check_cmd += args.project_core
+            platform_check_cmd += ["--nb_cpu", str(len(args.project_core))]
+
+        if execute(ts, [platform_check_cmd], args.lsfproject, args.lsfqueue):
+            return True
+
+    if not any(args.nb_cpu):
+        return False
+
+    if reset_env(ts, args.dir, args.minitb, args.minitb_dir):
+        return True
+
+    ts.show("Pre-compiling GenASM-MP C libraries...", log=True)
+    try:
+        compile_libs(
+                popeye_path,
+                args.dir,
+                platform_checker="platform_checker" in args.force_configs,
+                project=args.project)
+    except subprocess.CalledProcessError:
+        return True
+
+    return False
+
+
+def get_test_args(args, build_rtl, popeye_path, regr_rid=None):
+    "get the basic set of arguments that will be passed to all tests"
+
+    command_args = ["--project", args.project,
+                    "--dir", args.dir]
+    if args.project_run and args.project_run != args.project:
+        command_args.extend(["--project_run", args.project_run])
+
+    if args.fastsim:
+        if os.path.exists(args.manifest):
+            manifest_path = args.manifest
+        else:
+            manifest_path = fetch_manifest_to_dir(revision=args.manifest,
+                                                  path_in_repo=f'nahpc2/{args.project_run}',
+                                                  output_dir=os.path.join(popeye_path, args.dir, 'manifests'))
+        components_revisions = get_component_revisions_from_manifest(manifest_path, vars(args))
+        assert are_manifest_components_available(components_revisions), "Some fastsim components are missing"
+
+        command_args.extend(("--manifest", manifest_path))
+
+    if regr_rid:
+        command_args.extend(["--regr_rid", str(regr_rid)])
+    if args.disass:
+        command_args.append("--disass")
+    if args.human:
+        command_args.append("--human")
+    if args.keepall:
+        assert not args.force_clean, "--force_clean and --keepall are mutually exclusive"
+    elif args.keepelfs:
+        assert not args.keepall, "--keepall and --keepelfs are mutually exclusive"
+        assert not args.force_clean, "--keepelfs and --force_clean are mutually exclusive"
+        command_args.append("--postclean") # postclean level 1: delete only sources
+    else:
+        command_args.append("--postclean")
+        command_args.append("--postclean") # postclean level 2: by default delete everything if no fail
+    if args.force_clean:
+        command_args.append("--force_clean")
+    if args.short_cfg:
+        command_args.append("--short_cfg")
+    if args.fill_zeroes:
+        command_args.append("--fill_zeroes")
+    if args.fastsim:
+        command_args.append("--fastsim")
+    if args.tarmac:
+        command_args.append("--tarmac")
+    if args.tarmactrace:
+        command_args.append("--tarmactrace")
+    if args.addrextract:
+        command_args.append("--addrextract")
+    if args.acme:
+        command_args.append("--acme")
+    if args.acme_config:
+        command_args.extend(["--acme_config", str(args.acme_config)])
+    if args.minitb:
+        command_args.append("--minitb")
+    if args.utb:
+        command_args.append("--utb")
+    if args.isscmp:
+        command_args.append("--isscmp")
+    if args.evs:
+        command_args.append("--evs")
+    if args.gmpxcmp:
+        command_args.append("--gmpxcmp")
+    if args.ecc:
+        command_args.append("--ecc")
+    if args.maxgentime:
+        command_args.extend(["--maxgentime", str(args.maxgentime)])
+    if args.maxruntime:
+        command_args.extend(["--maxruntime", str(args.maxruntime)])
+    if args.maxruncycles:
+        command_args.extend(["--maxruncycles", str(args.maxruncycles)])
+    if build_rtl:
+        command_args.append("--build_rtl")
+    if args.fsdb:
+        command_args.append("--fsdb")
+    if args.override:
+        command_args.append("--override")
+        command_args.extend(args.override)
+    if args.minitb_simbuild:
+        command_args.append("--minitb_simbuild")
+        command_args.extend(args.minitb_simbuild)
+    if args.minitb_sconfig:
+        command_args.append("--minitb_sconfig")
+        command_args.extend(args.minitb_sconfig)
+    if args.simopts:
+        command_args.append("--simopts")
+        command_args.extend(args.simopts)
+    if args.sim:
+        command_args.extend(("--sim", args.sim))
+
+    if not args.skip_eap_upload:
+        if args.eap_project:
+            command_args.extend(("--eap_project", args.eap_project))
+        if args.eap_prod:
+            command_args.append("--eap_prod")
+
+    return command_args
+
+def remaining_jobs(job_id):
+    "check how many jobs that were launched under the given `job_id' are still running"
+
+    with subprocess.Popen(["bjobs", "-A", str(job_id)],
+                          text=True,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT) as procid:
+        try:
+            for i, line in enumerate(procid.stdout):
+                parts = line.split()
+                if i == 0:
+                    headers = parts
+                elif i == 1:
+                    pending = int(parts[headers.index("PEND")])
+                    started = int(parts[headers.index("RUN")])
+                    return pending + started, started
+            return None, None
+        except ValueError:
+            print(line)
+            return None, None
+        finally:
+            procid.wait()
+
+def generate_test_array(args, build_rtl, popeye_path, regr_rid=None):
+    "generate a file containing an array of arguments"
+
+    xfilter_list = [os.path.join(popeye_path, "regression", "genasm_mp", "default.xfilter_list")]
+
+    project_xfilter_list = os.path.join(popeye_path, "regression", "genasm_mp", "{}.xfilter_list".format(args.project))
+    if os.path.exists(project_xfilter_list):
+        xfilter_list.append(project_xfilter_list)
+
+    for xlist in args.xfilter_list:
+        xfilter_list.append(os.path.join(popeye_path, "regression", "genasm_mp", xlist))
+
+    config_list = ConfigListParser(
+            [os.path.join(popeye_path, "regression", "genasm_mp", test_l) for test_l in args.test_list],
+            xfilter_list,
+            args.filter_config,
+            args.xfilter_config,
+            get_default_requirements(args.project, "genasm_mp"),
+    )
+
+    # TODO(papkan01, GENMP.2020-08, remove when users have migrated to genasm_mp_config_list)
+    with open(os.path.join(args.dir, 'config_list_weights.json'), 'w') as fp:
+        weighted_configs = {' '.join(key): weight for key, weight in config_list.list_choice.all_options_d.items()}
+        json.dump(weighted_configs, fp)
+
+    job_array = tempfile.mktemp(prefix="job_array_{0:s}_{1:d}_".format(args.project, args.seed), dir=args.dir)
+
+    cluster_cpu_thread_l = [
+            (nb_cluster, nb_cpu, threads_per_cpu)
+            for nb_cluster in args.nb_cluster
+            for nb_cpu in args.nb_cpu
+            for threads_per_cpu in args.threads_per_cpu
+            if not args.max_total_threads or nb_cluster * nb_cpu * threads_per_cpu <= args.max_total_threads
+    ]
+
+    assert cluster_cpu_thread_l, "No cluster/cpu/thread combination possible with given arguments"
+
+    with open(job_array, "w") as job_fd:
+        if regr_rid:
+            job_fd.write("# regr rid {}\n".format(regr_rid))
+        if build_rtl:
+            job_fd.write("# build job\n")
+            i = 0
+            for nb_cluster, nb_cpu, threads_per_cpu in cluster_cpu_thread_l:
+                i += 1
+                job_args = [str(i),
+                            "--seed", str(args.seed + i),
+                            "--nb_cluster", str(nb_cluster),
+                            "--nb_cpu", str(nb_cpu),
+                            "--threads_per_cpu", str(threads_per_cpu),
+                            "--bo", args.bo,
+                            "--configs", "mini_asm"]
+
+                job_args += args.force_configs
+                if args.project_core:
+                    job_args.append("--project_core")
+                    job_args += args.project_core[:nb_cpu * nb_cluster]
+
+                if args.name_seed:
+                    job_args.append(f"--name genasm_mp_s_{args.seed + i}")
+
+                job_fd.write(" ".join(job_args))
+                job_fd.write("\n")
+
+            return job_array, i
+
+        else:
+            for i in range(1, args.nb_test + 1):
+                nb_cluster, nb_cpu, threads_per_cpu = random.choice(cluster_cpu_thread_l)
+                job_args = [str(i),
+                            "--seed", str(args.seed + i),
+                            "--nb_cluster", str(nb_cluster),
+                            "--nb_cpu", str(nb_cpu),
+                            "--threads_per_cpu", str(threads_per_cpu)]
+
+                nb_rn_bfm = random.choice(args.nb_rn_bfm)
+                if nb_rn_bfm:
+                    job_args += ["--nb_rn_bfm", str(nb_rn_bfm)]
+                nb_acp_bfm = random.choice(args.nb_acp)
+                if args.nb_acp:
+                    job_args += ["--nb_acp", str(nb_acp_bfm)]
+
+                job_args.append("--configs")
+                job_args += config_list.get_next()
+                job_args += args.force_configs
+
+                if args.bo is not None:
+                    job_args += ["--bo", args.bo]
+                if args.project_core:
+                    job_args.append("--project_core")
+                    job_args += args.project_core[:nb_cpu * nb_cluster]
+
+                if args.name_seed:
+                    job_args.append(f"--name genasm_mp_s_{args.seed + i}")
+
+                job_fd.write(" ".join(job_args))
+                job_fd.write("\n")
+
+            return job_array, args.nb_test
+
+def launch_regr(ts, args, build_rtl, popeye_path, regr_rid):
+    job_array, job_num = generate_test_array(args, build_rtl, popeye_path, regr_rid)
+
+    bsub_args = ["bsub",
+                 "-R", "{0:s} rusage[mem={1:d}]".format(get_lsf_os_resources(), args.lsfmem),
+                 "-F", str(args.lsffilelimit),
+                 "-W", str(args.lsftimeout),
+                 "-sp", "60",
+                 "-o", os.path.join(popeye_path,
+                                    args.dir,
+                                    "bsub",
+                                    "%I.log"),
+                 "-J", "genasm_mp[1-{0:d}]%{1:d}".format(job_num, args.lsfslotlimit),
+                 "-P", args.lsfproject,
+                 "-q", args.lsfqueue,
+                 "-Jd", "top_val-PD-risgen_genasm", # required for "green" flow classification
+                 "-g", "/cpg/{0:s}/sim/top/ris/genasm-mp/run".format(args.lsfproject.lower())]
+
+    if args.pycov:
+        bsub_args.append("coverage_popeye")
+
+    bsub_args += ["genasm_mp", "--keep_libs", "--arg_file", job_array]
+    bsub_args += get_test_args(args, build_rtl, popeye_path, regr_rid)
+
+    ts.show("Launching GenASM-MP {0:s} job array...".format("build" if build_rtl else "test"), log=True)
+    ts.log(" ".join(bsub_args))
+    with subprocess.Popen(bsub_args,
+                          text=True,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE) as procid:
+        out, err = procid.communicate()
+        retcode = procid.wait()
+
+    job_id = None
+
+    if retcode:
+        ts.warn(err)
+        ts.error("bsub returned {}".format(retcode))
+    else:
+        match = re.search(r"Job <(\d+)>", out)
+        if match:
+            job_id = int(match.group(1))
+
+        if regr_rid:
+            ts.log("Regression status::regr_rid: {}".format(regr_rid))
+
+        if job_id is not None:
+            ts.log("Job id: {}".format(job_id))
+
+    return job_id, job_num
+
+def wait_regr(ts, args, job_id, job_num):
+    sleep_time = args.monitor if args.monitor else 15.0
+    ts.show("Waiting for {0:d} jobs to finish...".format(job_num), log=True)
+
+    start_time = time.time()
+    job_num_old = job_started_old = None
+
+    while job_num or job_num is None:
+        time.sleep(sleep_time)
+        job_num, job_started = remaining_jobs(job_id)
+        if job_num is None:
+            time.sleep(sleep_time)
+            continue
+        ts.show("remaining: {0:d}, started: {1:d}, running: {2:.0f}s".format(job_num,
+                                                                             job_started,
+                                                                             time.time() - start_time))
+        if (job_num != job_num_old or job_started != job_started_old) and ts.is_interactive():
+            ts.log("jobs: remaining: {0:d}, started: {1:d}".format(job_num, job_started))
+            job_num_old = job_num
+            job_started_old = job_started
+
+def check_regr(ts, popeye_path, sub_dir):
+    ts.show("Checking result...", log=True)
+    genasm_mp_path = os.path.join(popeye_path, sub_dir)
+
+    regr_result = RegrResult(genasm_mp_path)
+    regr_result.get_check_objects()
+    regr_result.count_json_statistics(ts)
+    return regr_result.print_statistics(ts.out, verbose=1)
+
+def get_args():
+    "generate and execute the argument line parser"
+
+    def range_int(minval, maxval):
+        def range_int_type(x):
+            ix = int(x)
+            if minval <= ix <= maxval:
+                return ix
+            else:
+                raise argparse.ArgumentTypeError("value has to be between {} and {}".format(minval, maxval))
+        return range_int_type
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--nb_test",
+                        type=range_int(0, 25000),
+                        required=True,
+                        help="number of tests to run")
+    parser.add_argument("--nb_cpu",
+                        type=int,
+                        nargs="+",
+                        default=[1, 2, 3, 4],
+                        choices=list(range(MAX_NB_CPUS+1)),
+                        help="number of cpus to target, multiple values possible")
+    parser.add_argument("--nb_cluster",
+                        type=int,
+                        nargs="+",
+                        default=[1],
+                        choices=[1, 2, 4, 6, 8],
+                        help="targetted number of clusters")
+    parser.add_argument("--threads_per_cpu", "--threads_per_core",
+                        type=int,
+                        nargs="+",
+                        default=[1],
+                        choices=[1, 2, 3, 4, 6, 8],
+                        help="number of threads per core, multiple values possible")
+    parser.add_argument("--max_total_threads",
+                        type=int,
+                        help="restrict combinations of clusters/cpus/threads")
+    parser.add_argument("--nb_rn_bfm",
+                        type=int,
+                        nargs="+",
+                        default=[0],
+                        choices=[0, 1],
+                        help="number of RN-BFMs to target, multiple values possible")
+    parser.add_argument("--nb_acp",
+                        type=int,
+                        nargs="+",
+                        default=[0],
+                        choices=[0, 1, 2],
+                        help="number of ACP-BFM per cluster to target")
+    parser.add_argument("--test_list",
+                        type=Path,
+                        nargs="+",
+                        default=[Path("default_asm.list")],
+                        help="list of test config list files names to use, it can be a relative path from regression/genasm_mp/")
+    parser.add_argument("--filter_config",
+                        type=str,
+                        nargs="+",
+                        default=[],
+                        help="only configuration files which should be generated")
+    parser.add_argument("--xfilter_config",
+                        type=str,
+                        nargs="+",
+                        default=[],
+                        help="configuration files that should not be generated")
+    parser.add_argument("--xfilter_list",
+                        type=str,
+                        nargs="+",
+                        default=[],
+                        help="list of configuration files that should not be generated")
+    parser.add_argument("--project",
+                        type=str,
+                        choices=PROJECTS,
+                        required=True,
+                        help="targetted project")
+    parser.add_argument("--project_run",
+                        type=str,
+                        choices=RUN_PROJECTS,
+                        help="targetted project_run")
+    parser.add_argument("--project_core",
+                        type=str,
+                        nargs="*",
+                        help="use a different project for each core in the system. <cluster>:<cpu>:project [<cluster>:<cpu>:project [...]]")
+    parser.add_argument("--comment",
+                        action="store_true",
+                        help="enable comment in test source (disabled by default)")
+    parser.add_argument("--tarmac",
+                        action="store_true",
+                        help="launch test with univent tarmac plugin")
+    parser.add_argument("--tarmactrace",
+                        action="store_true",
+                        help="launch test with tarmactrace plugin")
+    parser.add_argument("--evs",
+                        action="store_true",
+                        help="If tarmac plugin is enabled, also generate EVS files")
+    parser.add_argument("--addrextract",
+                        action="store_true",
+                        help="Optional switch passed to tarmactrace to make the output in the format needed by Address Extract")
+    parser.add_argument("--fsdb",
+                        action="store_true",
+                        help="dump waves during simulation")
+    parser.add_argument("--gmpxcmp",
+                        action="store_true",
+                        help="run genasm_mp_exec_compare for each test")
+
+    # UTB options
+    parser.add_argument("--utb",
+                        action="store_true",
+                        help="Launch test on the UTB")
+    parser.add_argument("--build_rtl",
+                        action="store_true",
+                        help="send 1 blk_val job per build_config present in build_config file")
+    parser.add_argument("--maxruncycles",
+                        type=int,
+                        help="Set maxruncycles limit in validation simulation")
+    parser.add_argument("--simopts",
+                        type=str,
+                        nargs="+",
+                        default=[],
+                        help="Add more simopts to blk_val command")
+    parser.add_argument("--bo",
+                        type=str,
+                        help="Use a specific build option for UTB")
+
+    # Mini_tb options
+    parser.add_argument("--minitb",
+                        action="store_true",
+                        help="run test with top minitb validation")
+    parser.add_argument("--minitb_dir",
+                        type=str,
+                        default=None,
+                        help="Specify mini_tb's home directory, has to be set when runing mini_tb regression")
+    parser.add_argument("--minitb_simbuild",
+                        type=str,
+                        nargs="+",
+                        default=[],
+                        help="Use specific Mini_tb simbuild")
+    parser.add_argument("--minitb_sconfig",
+                        type=str,
+                        nargs="+",
+                        default=[],
+                        help="Add more sconfigs to validation command")
+
+
+    parser.add_argument("--pycov",
+                        action="store_true",
+                        help="Collect python code coverage")
+    parser.add_argument("--isscmp",
+                        action="store_true",
+                        help="add IssCompare to validation run (config no_wfi will be added to all tests targeting Isscmp)")
+    parser.add_argument("--ecc",
+                        action="store_true")
+    parser.add_argument("--dcc",
+                        action="store_true",
+                        help="launch test with DCC (data coherency checker)")
+    parser.add_argument("--fastsim", "--ctares",
+                        action="store_true",
+                        help="launch test with fastsim")
+    parser.add_argument("--acme",
+                        action="store_true",
+                        help="run test with ACME")
+    parser.add_argument("--acme_config",
+                        type=str,
+                        default="",
+                        help="Specify ACME config file")
+    parser.add_argument("--seed",
+                        type=int,
+                        default=random.randrange(1 << 32) // 10000 * 10000, # for easy matching with bsub log number
+                        help="specify the seed of first test to generate. Each test is then generated with seed++")
+    parser.add_argument("--name_seed",
+                        action="store_true",
+                        help="Make all the test name like: 'genasm_mp_s_<seed>', where <seed> is the test seed")
+    parser.add_argument("--lsfmem",
+                        type=int,
+                        help="specify the amount of memory to be allocated on LSF by bsub command (4096 by default)")
+    parser.add_argument("--lsfproject",
+                        type=str,
+                        help="force the use of a specific project code when sending to LSF")
+    parser.add_argument("--lsftimeout",
+                        type=int,
+                        help="force value of lsf timeout (10 min by default for fastsim only jobs and 6 hours for RTL sim)")
+    parser.add_argument("--lsfqueue",
+                        type=str,
+                        default="PD",
+                        help="force the use of a specific queue when sending to LSF")
+    parser.add_argument("--lsfslotlimit",
+                        type=int,
+                        default=4000,
+                        help="the maximum number of jobs that can run concurrently at any given time")
+    parser.add_argument("--lsffilelimit",
+                        type=int,
+                        default=8*1024*1024,
+                        help="the maximum file size that a job can create (in KB)")
+    parser.add_argument("--fill_zeroes",
+                        action="store_true",
+                        help="Initialize default testbenches memory to 0x00000000")
+    parser.add_argument("--maxgentime",
+                        type=int,
+                        help="Kill generation after x minutes")
+    parser.add_argument("--maxruntime",
+                        type=int,
+                        help="Kill launched test after x minutes")
+    parser.add_argument("--force_configs",
+                        type=str,
+                        nargs="+",
+                        default=[],
+                        help="configuration files that are always added at the end")
+    parser.add_argument("--override",
+                        type=str,
+                        nargs="+",
+                        default=[],
+                        help="Override a configuration settings with fixed values. key_1=val_1 [key_2=val_2 [...]]")
+    parser.add_argument("--disass",
+                        action="store_true",
+                        help="generate disass for each test")
+    parser.add_argument("--human",
+                        action="store_true",
+                        help="Generate human for each test")
+    parser.add_argument("--keepelfs",
+                        action="store_true",
+                        help="Keep ELFs and xlist files (use --postclean level 1)")
+    parser.add_argument("--keepall",
+                        action="store_true",
+                        help="Keep sources, ELFs, xlists (dont use --postclean)")
+    parser.add_argument("--force_clean",
+                        action="store_true",
+                        help="postclean even if a test failed")
+    parser.add_argument("--sim",
+                        type=str,
+                        help="Simulator to use when RTL sim [ mti (default) | vcs | nc ]")
+    parser.add_argument("--noreset",
+                        action="store_true",
+                        help="Don't restenv and dont re-pre-compile libs")
+    parser.add_argument("--short_cfg",
+                        action="store_true",
+                        help="use a shortended hash instead of full config names to build test name")
+    parser.add_argument("--monitor",
+                        type=int,
+                        const=10,
+                        nargs="?",
+                        help="Monitor regression until all jobs are done (print status every n seconds, n is 10 if no other value is specified)")
+    parser.add_argument("--dir",
+                        type=str,
+                        default="genasm_mp",
+                        help="subdirectory containing all generated files")
+    parser.add_argument("--check_result",
+                        action="store_true")
+    parser.add_argument("--run_platform_check",
+                        action="store_true",
+                        help="Run platform_checker test before submitting regression")
+    parser.add_argument("--skip_eap_upload",
+                        action="store_true",
+                        help="Skip uploading the results to EAP")
+    parser.add_argument("--eap_project",
+                        type=str,
+                        default="genasm_qa",
+                        help="EAP project under which results will be uploaded")
+    parser.add_argument("--eap_prod",
+                        action="store_true",
+                        help="Upload to EAP production server")
+    parser.add_argument("--manifest",
+                        type=str,
+                        default="stable",
+                        help="[<manifest repo branch or sha1> | <path to manifest file>] manifest for model and plugins")
+
+    return parser.parse_args()
+
+def fix_args(ts, args):
+    "fix the argument list and insert derived default values if none were given"
+
+    if not args.lsfproject:
+        try:
+            args.lsfproject = PROJECTS[args.project]["lsf_project"]
+        except KeyError as e:
+            raise ValueError("LSF project not specified for project '{}'".format(args.project)) from e
+
+    if not args.project_run:
+        args.project_run = get_project_run_alias(args.project)
+
+    if args.build_rtl and not args.bo:
+        raise ValueError("--bo should be specified when using --build_rtl")
+
+    args.test_list = [lst if lst.suffix else lst.with_suffix(".list") for lst in args.test_list]
+
+    if not args.lsftimeout:
+        if args.minitb:
+            args.lsftimeout = 360
+        else:
+            args.lsftimeout = 8 * 60
+
+    if not args.lsfmem:
+        args.lsfmem = 4096
+
+    disable_match = False
+    config_regex = re.compile(r"disable.*")
+    for cfg in args.force_configs:
+        if disable_match and not config_regex.match(cfg):
+            ts.warn("\n!!! WARNING!!!: Config {} appearing after disable cfg. Hope you know what you are doing\n".format(cfg))
+        disable_match = config_regex.match(cfg)
+
+    if not args.comment:
+        args.force_configs.append("no_comments")
+
+    if args.isscmp:
+        args.force_configs.append("no_wfi")
+        print("!!! INFO !!! Adding no_wfi to forced_configs when isscmp")
+
+    # REVISIT(remsau01, GENMP, fix default EAP uploads from local runs or Jenkins)
+    if args.eap_project == "genasm_qa" and not args.eap_prod:
+        args.skip_eap_upload = True
+
+    if os.path.exists(args.manifest):
+        args.manifest = os.path.abspath(args.manifest)
+
+    return args
+
+def main():
+    "main function to generate the regression"
+
+    with TermScroll() as ts:
+        args = fix_args(ts, get_args())
+
+        popeye_path = os.environ.get("POPEYE_HOME")
+        if not args.noreset:
+            if reset(ts, args, popeye_path):
+                return 1
+
+        random.seed(args.seed)
+
+        if not args.build_rtl:
+            actions = ((False, False),)
+        elif args.nb_test:
+            actions = ((True, True), (False, False))
+        else:
+            actions = ((True, False),)
+
+        for build_rtl, force_check in actions:
+            regr_rid = None
+            if not args.skip_eap_upload:
+                try:
+                    _, regr_rid = RegressionSchema(args.eap_project, args.eap_prod, args.project, args.project_core).upload()
+                except UploadSkippedException as ex:
+                    ts.log(str(ex))
+
+            job_id, job_num = launch_regr(ts, args, build_rtl, popeye_path, regr_rid)
+
+            if job_id is None:
+                return 1
+
+            if force_check or args.check_result or args.monitor:
+                wait_regr(ts, args, job_id, job_num)
+
+            if force_check or args.check_result:
+                retcode = check_regr(ts, popeye_path, args.dir)
+                if retcode:
+                    return retcode
+
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

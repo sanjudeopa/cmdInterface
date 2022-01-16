@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+# pylint: disable=missing-docstring
+
+import argparse
+import json
+import signal
+import pickle
+import sys
+import time
+import linecache
+import tracemalloc
+
+from lib_generator.generator_class import Generator
+from lib_generator.statistics_common import for_test
+from lib_generator.const_tbench import Constants
+
+from lib_shared.popeye_common import si_unit, display_checksum
+from lib_shared.const_log import getStdoutLogger, setLevel
+
+LOGGER = getStdoutLogger()
+
+def parse_args():
+    parser = argparse.ArgumentParser("Launch Popeye generator")
+
+    parser.add_argument("--project", type=str, required=True,
+                        help="Name of the DUT project")
+    parser.add_argument("--seed", type=int, required=True,
+                        help="Seed")
+    parser.add_argument("--configs", type=str, nargs="+", required=True,
+                        help="List of the configurations")
+
+    parser.add_argument("--no_human", action="store_true",
+                        help="Do not dump human readable files")
+    parser.add_argument("-v", dest="verbose_level", type=int, default=0,
+                        help="Verbosity level")
+
+    parser.add_argument("--include_special_disable_file", type=str,
+                        help="Name of a disable configuration to include")
+
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable profiling of the generator")
+    parser.add_argument("--tracemalloc", action="store_true",
+                        help="Enable memory profiling of the generator")
+    parser.add_argument("--pudb", action="store_true",
+                        help="Launch with awesome python debugger")
+    parser.add_argument("--debugpy", type=int,
+                        help="Launch with remote capable python debugger")
+
+    parser.add_argument("--ml-filter", action="store_true",
+                        help="Activate ML additions to force skip the tests if model doesnt pass test")
+
+    parser.add_argument("--timeout", type=int, default=25,
+                        help="Abort generation after the specified amount of minutes")
+
+    return parser.parse_args()
+
+class TimeoutException(Exception):
+    pass
+
+def display_top(snapshot, traceback, limit=10):
+    snapshot = snapshot.filter_traces((
+            tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
+            tracemalloc.Filter(False, "<unknown>"),
+    ))
+    top_stats = snapshot.statistics("traceback" if traceback else "lineno")
+    print(f"Top {limit} lines")
+    for index, stat in enumerate(top_stats[:limit], 1):
+        if traceback:
+            print(f"#{index}: {stat.size / 1024:.1f} KiB")
+            for line in stat.traceback.format():
+                print(line)
+        else:
+            frame = stat.traceback[0]
+            print(f"#{index}: {frame.filename}:{frame.lineno}: {stat.size / 1024:.1f} KiB")
+
+            line = linecache.getline(frame.filename, frame.lineno).strip()
+            if line:
+                print(f'    {line}')
+
+    other = top_stats[limit:]
+    if other:
+        print(f"{len(other)} other: {sum(stat.size for stat in other) / 1024:.1f} KiB")
+
+    print(f"Total allocated size: {sum(stat.size for stat in top_stats) / 1024:.1f} KiB")
+
+def main(args): # pylint: disable=too-many-statements
+    if args.verbose_level > 0:
+        setLevel(max(10 - args.verbose_level, 0))
+
+    generation_time = -time.time()
+
+    if args.pudb:
+        import pudb # pylint: disable=import-error,import-outside-toplevel
+        pudb.set_trace()
+    elif args.debugpy:
+        import debugpy # pylint: disable=import-error,import-outside-toplevel
+        debugpy.listen(args.debugpy) # Specify port to listen (by default on localhost)
+        LOGGER.info("Waiting for debugger attach on port %d", args.debugpy)
+        debugpy.wait_for_client() # Wait for the StudioCode debugger to attach
+        debugpy.breakpoint() # Configure a first breakpoint once Attach
+    else:
+        def raise_alarm(signum, frame):
+            raise TimeoutException
+        signal.signal(signal.SIGALRM, raise_alarm)
+        signal.alarm(args.timeout * 60)
+
+    popeye_stats = for_test()
+    popeye_stats["test_name"] = f"popeye_{args.seed}"
+
+    if args.tracemalloc:
+        tracemalloc.start(10) # record 10 frames in the traceback
+
+    try:
+        with open(Constants.PICKLE_BUILD_OPTIONS, "rb") as fh:
+            build_options = pickle.load(fh)
+
+        generator = Generator(args.project,
+                              build_options,
+                              args.seed,
+                              args.configs,
+                              [],
+                              "popeye",
+                              not args.no_human,
+                              args.verbose_level,
+                              args.include_special_disable_file,
+                             )
+
+        generator.randomize_all()
+        total_transactions = generator.generate_all()
+        generator.write_popeye_elf(name=Constants.POPEYE_ELF_FILE_NAME, init_mem=True)
+        if not args.no_human:
+            generator.write_popeye_human()
+        generator.check_asserts()
+
+        signal.alarm(0)
+
+    except TimeoutException:
+        popeye_stats["generation_fail"] = "timeout"
+        LOGGER.error("Generation took more than %d minutes, which is a performance issue.", args.timeout)
+        return 1
+
+    except Exception as e:
+        exception_name = e.__class__.__name__
+        popeye_stats["generation_fail"] = exception_name
+        LOGGER.error("exception %s %s", exception_name, e)
+        raise
+
+    finally:
+        generation_time += time.time()
+        popeye_stats["generation_time"] = generation_time
+        with open(Constants.POPEYE_STATISTICS_FILE_NAME, "w") as stats_fh:
+            json.dump(popeye_stats, stats_fh, indent=2, sort_keys=True, separators=(',', ': '))
+
+        if args.tracemalloc:
+            snapshot = tracemalloc.take_snapshot()
+            snapshot.dump("tracemalloc.dump")
+            display_top(snapshot, "traceback")
+
+    LOGGER.info("Test generation complete. Generated %d transactions in %s (%s)",
+                total_transactions,
+                si_unit(generation_time, "s"),
+                si_unit(total_transactions / generation_time, "T/s"))
+
+    LOGGER.info(display_checksum("popeye.elf"))
+
+    return 0
+
+if __name__ == "__main__":
+    ARGS = parse_args()
+
+    if ARGS.profile:
+        profile_filename = "generator_profile.out"
+        import cProfile
+        cProfile.run("sys.exit(main(ARGS))", profile_filename)
+        import pstats
+        p = pstats.Stats(profile_filename)
+        p.sort_stats('cumulative').print_stats()
+    else:
+        sys.exit(main(ARGS))

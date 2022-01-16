@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+
+# pylint: disable=missing-docstring
+
+import os
+import sys
+import re
+import argparse
+import pickle
+from glob import glob
+from itertools import groupby
+
+from lib_gmp.test_history import get_last_test_name
+
+def parse_args():
+    # Example: for a ticket semaphore:
+    # genasm_mp_semaphore_debugger \
+    #       --compress \
+    #       --regexp "[0-9]\.\.\.\. \.\.\.\.\.\.\.\.    S:0024b64da0" "[0-9] \.\.\.\.\.\.\.\.    S:0024b64da0" \
+    #       --tarmac tarmacs.cpu.cpu*.log | less -R
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tarmac", type=str, nargs="+")
+    parser.add_argument("--regexp", type=str, nargs="+")
+    parser.add_argument("--iregexp", type=str, default=r"\bST\b")
+    parser.add_argument("--payloads", type=str, nargs="+", help="include accesses that touched these payloads")
+    parser.add_argument("--layout-pickle", type=argparse.FileType("rb"), help='use this layout to determine the range of --payloads')
+    parser.add_argument("--highlight", type=str, default="agent", choices=["agent", "match"])
+    parser.add_argument("--compress", action="store_true")
+    parser.add_argument("--dir", default="genasm_mp", help="Subdirectory containing all generated files")
+    return parser.parse_args()
+
+def get_payloads_pattern_and_antipattern_l(payloads, layout_pickle):
+    """
+    using <layout_pickle>, get the range corresponding to the <payloads>
+    return list of regex 2-tuples  [(pattern, antipattern), ...]
+    """
+    pattern_and_antipattern_l = []
+    layout_generator = pickle.load(layout_pickle)
+    for layer_name in layout_generator.get_physical_layers():
+        layer = layout_generator[layer_name]
+        payloads_range = layer.get_usage().get_range_payloads(payloads)
+        security = str(layer.get_security_space())
+        for addr_start, addr_end in payloads_range[::0x10]:
+            addr_aligned = addr_start - addr_start % 0x10
+            pattern = re.compile(f' {security}:{addr_aligned:>016x}')
+
+            if addr_end - addr_start == 0x10:
+                antipattern = None
+            else:
+                # If only a subset of the 16 bytes are accessed, (addr_start, addr_end) may not be part of that subset.
+                # We must exclude any access where no byte in range (addr_start, addr_end) is accessed.
+                # Such unaccessed byte is represend by '..'.
+                # example: ST 0000ffffffffbf70  ........ ........ ..00.... ........   S:0000000240001f70
+                per_byte_access_repr = [r'\.\.' if addr_start <= i < addr_end else r'\S\S'
+                                        for i in reversed(range(addr_aligned, addr_aligned + 0x10))]
+                antipattern = re.compile(' '.join(''.join(per_byte_access_repr[4 * i:4 * (i + 1)]) for i in range(4)))
+
+            pattern_and_antipattern_l.append((pattern, antipattern))
+
+    return pattern_and_antipattern_l
+
+def get_tarmac_matches(cpu_num, tarmac_fd, pattern_and_antipattern_l, iregexp, highlight):
+    match_list = []
+    time = None
+
+    for line in tarmac_fd:
+        line = line.rstrip()
+        words = line.split()
+        if len(words) > 1 and words[1] in ("clk", "tic", "ns"):
+            time = int(words[0], 0)
+            label_offset = words[-1].strip("<>")
+
+        if time is None:
+            continue
+
+        for i, (pattern, anti_pattern) in enumerate(pattern_and_antipattern_l):
+            match = pattern.search(line)
+            if match is None or (anti_pattern and anti_pattern.search(line)):
+                continue
+
+            hl_group = 0 if iregexp.search(line) is None else 7
+
+            if highlight == "agent":
+                hl_line = "".join(("\033[{};{}m".format(hl_group, 31 + cpu_num), line, "\033[0m"))
+            elif highlight == "match":
+                start = match.start()
+                end = match.end()
+                hl_line = "".join((line[:start], "\033[{};{}m".format(hl_group, 31 + i), line[start:end], "\033[0m", line[end:]))
+            else:
+                raise ValueError("unknown highlight mode")
+
+            match_list.append((time, cpu_num, label_offset, hl_line, i))
+            break
+
+    return match_list
+
+def main(args):
+    assert args.regexp or args.payloads, 'At least one of --regexp or --payloads should be given'
+
+    # list of tuples (pattern, Optional[antipattern])
+    # a line matches the tuple if pattern matches and antipattern does not match
+    pattern_and_antipattern_l = []
+
+    if args.regexp:
+        pattern_and_antipattern_l.extend((re.compile(r), None) for r in args.regexp)
+    if args.payloads:
+        assert args.layout_pickle, 'layout pickle is necessary to determine payloads range'
+        pattern_and_antipattern_l.extend(get_payloads_pattern_and_antipattern_l(args.payloads, args.layout_pickle))
+
+    iregexp = re.compile(args.iregexp)
+
+    genasm_path = os.path.join(os.environ.get("POPEYE_HOME"), args.dir)
+
+    if args.tarmac is None:
+        test_name = get_last_test_name(args.dir)
+        # REVISIT(remsau01, GENMP, some tarmac plugins/platforms don't have the same filename format)
+        tarmacs = glob(os.path.join(genasm_path, "tests", test_name, "*.tarmac.*"))
+    else:
+        tarmacs = args.tarmac
+
+    # gather all matches
+    match_list = []
+    for cpu_num, tarmac_path in enumerate(sorted(tarmacs)):
+        with open(tarmac_path, "r") as tarmac_fd:
+            match_list += get_tarmac_matches(cpu_num, tarmac_fd, pattern_and_antipattern_l, iregexp, args.highlight)
+
+    # sort them by time
+    match_list = sorted(match_list, key=lambda x: x[0])
+
+    # print formatted output
+    try:
+        if args.compress:
+            for _, itergroup in groupby(match_list, lambda x: x[1:]):
+                group = list(itergroup)
+                rep = len(group)
+                time, cpu_num, label_offset, hl_line, _ = group[0]
+                print("{:5d}x CPU{:02d} {:10d} {:50s} {:s}".format(rep, cpu_num, time, label_offset, hl_line))
+        else:
+            for time, cpu_num, label_offset, hl_line, _ in match_list:
+                print("    1 CPU{:02d} {:10d} {:50s} {:s}".format(cpu_num, time, label_offset, hl_line))
+    except IOError:
+        pass
+
+if __name__ == "__main__":
+    sys.exit(main(parse_args()))

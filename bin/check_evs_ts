@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+
+# type: ignore
+
+'Checks that an evs has monotonic timestamps'
+
+from argparse import ArgumentParser
+
+import cEvs
+
+from lib_checkers.smart_events.datachecker import CLASSES
+from lib_checkers.checker import myformat
+from lib_shared.popeye_common import open_retry
+
+def main(argv):
+    "Evaluate evs for monotonic timestamp"
+
+
+    parser = ArgumentParser(description=main.__doc__)
+    parser.add_argument("-i", dest="evs", default=None)
+    parser.add_argument("-I", dest="retry_evs", default=None)
+
+    args = parser.parse_args(argv)
+
+    evs_i = args.evs if args.retry_evs is None else args.retry_evs
+
+    current_ts = 0
+    current_event = None
+
+    with (open_retry if args.retry_evs is not None else open)(evs_i, 'rb') as fh:
+        for event in cEvs.BinaryStreamReader(fh, classes=CLASSES):
+            ts = event.props.get('ts', {}).get('val', -1)
+            if ts >= current_ts:
+                current_ts = ts
+                current_event = event
+            else:
+                raise Exception('Error: Detected non-monotonic timestamps\n'
+                                '{}\n'
+                                '##########################\n'
+                                'has smaller timestamp than\n'
+                                '##########################\n'
+                                '{}'. format(myformat(event), myformat(current_event)))
+
+if __name__ == '__main__':
+    import sys
+    sys.exit(main(sys.argv[1:]))

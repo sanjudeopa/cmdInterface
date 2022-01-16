@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+
+"""
+Compare an evs execution events to the expected execution events from the generator
+"""
+# TODO(papkan01, GENMP, not supported with rme fastsim or siris)
+# rme fastsim: wrong security space in evs
+# siris: have to handle tags
+
+import os
+import sys
+import argparse
+import json
+from collections import defaultdict
+from typing import List, Tuple, Iterator
+
+from lib_generator.execute_asm_event import ExecuteAsmEvent as XasmEvent
+from lib_gmp.evs_tools import get_evs_events, merge_evs_events, format_evs_event, EvsEvent
+from lib_gmp.test_name_handler import TestName
+from lib_gmp.test_history import get_last_test_name
+
+
+def get_xasm_events(xasm_file_path: str) -> XasmEvent:
+    """
+    yield xasm events from <xasm_file_path>
+    """
+    with open(xasm_file_path) as fh:
+        for xasm_dict in json.load(fh):
+            yield XasmEvent.from_dict(xasm_dict)
+
+
+def compare_evs_event_and_xasm_event(evs_event: EvsEvent, xasm_event: XasmEvent) -> None:
+    """
+    compare evs <evs_event> and <xasm_event> from generator
+    """
+    def check_abort() -> None:
+        assert not(xasm_event.is_definite_abort and not evs_event.is_abort), 'instruction was expected to abort but did not'
+
+    def check_register_updates() -> None:
+        # TODO(papkan01, GENMP, we should also check registers found in one but not the other)
+        evs_updates = {update.reg_name: update for update in evs_event.reg_updates}
+        expected_updates = {update.reg_name: update for update in xasm_event.reg_updates}
+
+        for reg_name in evs_updates.keys() & expected_updates.keys():
+            if reg_name == 'CPSR':
+                continue
+            evs_update = evs_updates[reg_name]
+            expected_update = expected_updates[reg_name]
+            # by masking expected_update.val with evs_update.known, we are relaxing check for the following case:
+            # fastsim did not update part of a register but it should have.
+            # we currently have to do this because expected_update.known it not limited to the range of the register accessed by the instruction
+            assert (evs_update.val & evs_update.known & expected_update.known
+                    == expected_update.val & evs_update.known & expected_update.known), f'register mismatch on {reg_name}'
+
+    def check_memory_updates() -> None:
+        evs_updates = {(update.pa, update.security): update for update in evs_event.mem_updates}
+        expected_updates = {(update.pa, update.security): update for update in xasm_event.mem_updates}
+
+        for pa, security in evs_updates.keys() & expected_updates.keys():
+            expected_update = expected_updates[pa, security]
+            evs_update = evs_updates[pa, security]
+            size = evs_update.size
+            assert (evs_update.val & evs_update.known & expected_update.known
+                    == expected_update.val & evs_update.known & expected_update.known), f'memory update mismatch on {security}:[{pa:#x},{pa+size:#x}['
+
+        if not xasm_event.addr_unknown_in_model:
+            # for atomics, evs shows stores even if the store did not happen. But they are marked unknown
+            # for the next check, let's ignore addresses for which the written value is unknown
+            for pa, security in evs_updates.keys() - expected_updates.keys():
+                size = evs_updates[pa, security].size
+                assert not evs_updates[pa, security].known, f'unexpected memory update on {security}:[{pa:#x},{pa+size:#x}['
+
+            if not xasm_event.is_definite_abort:
+                for pa, security in expected_updates.keys() - evs_updates.keys():
+                    size = expected_updates[pa, security].size
+                    assert not expected_updates[pa, security].known, f'expected memory update did not occur on {security}:[{pa:#x},{pa+size:#x}['
+
+    def check_tag_updates() -> None:
+        evs_updates = {(update.pa, update.security): update for update in evs_event.tag_updates}
+        expected_updates = {(update.pa, update.security): update for update in xasm_event.tag_updates}
+
+        for pa, security in evs_updates.keys() & expected_updates.keys():
+            expected_update = expected_updates[pa, security]
+            evs_update = evs_updates[pa, security]
+            assert not expected_update.known or (expected_update.val == evs_update.val), f'tag update mismatch on granule {security}:{pa:#x}'
+
+        if not xasm_event.addr_unknown_in_model:
+            for pa, security in evs_updates.keys() - expected_updates.keys():
+                assert not evs_updates[pa, security].known, f'unexpected tag update on granule {security}:{pa:#x}'
+
+            for pa, security in expected_updates.keys() - evs_updates.keys():
+                assert not expected_updates[pa, security].known, f'expected tag update did not occur on granule {security}:{pa:#x}'
+
+    check_abort()
+    check_register_updates()
+    check_memory_updates()
+    check_tag_updates()
+
+
+def parse_args() -> argparse.Namespace:
+    """
+    Return namedtuple mapping the command line arguments
+    """
+    parser = argparse.ArgumentParser(description="Compare runtime evs against execute_asm events.\n")
+    group_test_name = parser.add_argument_group('To compare evs and xasm files for a given test')
+    group_test_name.add_argument("test_name", nargs="?", help="Test to debug. If none given, use last generated test")
+    group_test_name.add_argument("--dir", default="genasm_mp", help="genasm generation dir")
+    group_single_evs = parser.add_argument_group('To compare specific evs and xasm files')
+    group_single_evs.add_argument("--evs",
+                                  type=str,
+                                  help="the evs file")
+    group_single_evs.add_argument("--xasm",
+                                  type=str,
+                                  help="the execute_asm events file")
+    args = parser.parse_args()
+
+    if (args.evs is not None or args.xasm is not None) and args.test_name is not None:
+        parser.error("use 'TEST_NAME [--dir ...]' xor '--evs ... --xasm ...'")
+
+    if (args.evs is None) != (args.xasm is None):
+        parser.error("--evs and --xasm should both be given if one is given")
+
+    return args
+
+
+def get_test_evs_and_xasm_files(test_path: str, test_name: str) -> Iterator[Tuple[str, str]]:
+    """
+    yield matched tuples (evs_file, xasm_file) for <test_name>
+    """
+    test_name_struct = TestName.extract(test_name)
+    assert test_name_struct.threads == 1, 'more than one thread per cpu is not supported'
+    nb_clusters = test_name_struct.clusters
+    nb_cpus = test_name_struct.cpus
+
+    for i in range(nb_cpus * nb_clusters):
+        cluster, cpu = divmod(i, nb_cpus)
+        evs_file = os.path.join(test_path, 'fastsim.cpu.cpu{}.evs'.format(i))
+        xasm_file = os.path.join(test_path, 'xasm_events.CL{}_CPU{}.json'.format(cluster, cpu))
+        yield (evs_file, xasm_file)
+
+
+def compare_evs_and_xasm(evs_file: str, xasm_file: str) -> None:
+    """
+    Compare evs events against execute_asm_events
+    Fail on first mismatch
+    """
+    raw_evs_events = get_evs_events(evs_file)
+    pc_to_xasm_event = {event.pc: event for event in get_xasm_events(xasm_file)}
+    nb_checked_events = 0
+    nb_total_events = 0
+    pc_counts = defaultdict(int)
+
+    while True:
+        try:
+            raw_evs_event = next(raw_evs_events)
+            nb_total_events += 1
+        except StopIteration:
+            print('no mismatch found.', f'checked {nb_checked_events} / {nb_total_events} events')
+            return 0
+
+        if raw_evs_event.body.type == 'PREFETCH':
+            # instruction fetch
+            continue
+
+        event_pc = raw_evs_event.body.pc
+        pc_counts[event_pc] += 1
+        xasm_event = pc_to_xasm_event.get(event_pc)
+        if xasm_event is None:
+            # no xasm has this pc
+            # this is the case for c library code or test header
+            continue
+
+        if xasm_event.check_once and pc_counts[event_pc] > 1:
+            continue
+
+        nb_checked_events += 1
+        evs_event = format_evs_event(raw_evs_event)
+        # if xasm_event groups multiple instructions (for example GenInstrAsmMOVPSEUDOIMM)
+        # merge the corresponding evs instructions
+        additional_evs_events: List[EvsEvent] = []
+        for pc in range(event_pc + 4, event_pc + xasm_event.size, 4):
+            try:
+                next_raw_event = next(raw_evs_events)
+            except StopIteration as exc:
+                raise KeyError(f"not enough instructions in evs to match the expected event group\n{xasm_event}") from exc
+            next_event_pc = next_raw_event.body.pc
+
+            if next_raw_event.body.type in ("ASYNC", "PREFETCH"):
+                # An ASYNC event during an xasm event group
+                # Consume all the events (supposedly in the C code) until getting back to the test
+                while True:
+                    try:
+                        next_raw_event = next(raw_evs_events)
+                    except StopIteration as exc:
+                        raise KeyError("ASYNC/PREFETCH event does not return to test") from exc
+                    next_event_pc = next_raw_event.body.pc
+
+                    if next_event_pc == pc:
+                        break
+
+            assert next_event_pc == pc, f"pc {next_event_pc} is not consistent with contiguous expected event group\n{xasm_event}"
+            additional_evs_events.append(format_evs_event(next_raw_event))
+
+        if additional_evs_events:
+            evs_event = merge_evs_events(evs_event, *additional_evs_events)
+
+        try:
+            compare_evs_event_and_xasm_event(evs_event, xasm_event)
+        except AssertionError as exc:
+            print('\n'.join((
+                    f"Mismatch at occurence {pc_counts[event_pc]} of pc: {event_pc:#x}",
+                    f"timestamp: {evs_event.timestamp}",
+                    f"disass: {evs_event.disass}",
+                    f"failure: {exc}"
+            )))
+            return 1
+
+
+def main(args):
+    """
+    compare evs and xasm files
+    """
+    if args.evs:
+        files_to_compare = [(args.evs, args.xasm)]
+    else:
+        test_name = args.test_name or get_last_test_name(args.dir)
+        test_path = os.path.join(os.environ.get("POPEYE_HOME"), args.dir, "tests", test_name)
+        files_to_compare = get_test_evs_and_xasm_files(test_path, test_name)
+
+    ret_code = 0
+    for evs_file, xasm_file in files_to_compare:
+        print('evs:', evs_file)
+        if compare_evs_and_xasm(evs_file, xasm_file):
+            ret_code = 1
+    return ret_code
+
+
+if __name__ == "__main__":
+    sys.exit(main(parse_args()))

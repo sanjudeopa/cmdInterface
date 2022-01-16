@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+# -*- python -*-
+# vim: set syntax=python:
+
+from random import Random
+from locale import getpreferredencoding
+from range_payload import RangeWithPayload
+from range_object import RangeObject
+import layout_consts
+from layout_frames import Layer, \
+                          PhysicalLayout, \
+                          PartialGranuleFrame, \
+                          MatchingGranuleFrame, \
+                          AggregatingGranuleFrame, \
+                          Stage1Page, \
+                          Stage2Page, \
+                          PreliminaryFrame, \
+                          PreliminaryPhysicalLayout, \
+                          PreliminaryVirtualLayout
+
+def test_layout1():
+    # pylint: disable=bad-whitespace
+    layout = RangeWithPayload()
+    layout.add_region_payload(                        0,                1 * MEM_4K, "foo1.1")
+    layout.add_region_payload(               1 * MEM_4K,                2 * MEM_4K, "foo1.2")
+    layout.add_region_payload(             511 * MEM_4K, 1 * MEM_2M               , "foo1.511")
+    layout.add_region_payload(1 * MEM_2M               , 2 * MEM_2M               , "foo2.1")
+    layout.add_region_payload(1 * MEM_2M               , 1 * MEM_2M +   1 * MEM_4K, "foo2.1.1")
+    layout.add_region_payload(1 * MEM_2M +   3 * MEM_4K, 1 * MEM_2M +   4 * MEM_4K, "foo2.1.2")
+    layout.add_region_payload(1 * MEM_2M + 400 * MEM_4K, 1 * MEM_2M + 401 * MEM_4K, "foo2.1.400")
+    layout.add_region_payload(2 * MEM_2M               , 3 * MEM_2M               , "foo2.2")
+    layout.add_region_payload(3 * MEM_2M               , 3 * MEM_2M +   1 * MEM_4K, "foo3.1")
+
+    return layout
+
+def test_layout2():
+    # pylint: disable=bad-whitespace
+    layout = RangeWithPayload()
+    layout.add_region_payload(                        0,                1 * MEM_4K, "foo1.1")
+    layout.add_region_payload(               1 * MEM_4K,                2 * MEM_4K, "foo1.2")
+    layout.add_region_payload(             511 * MEM_4K, 1 * MEM_2M               , "foo1.511")
+    layout.add_region_payload(1 * MEM_2M               , 1 * MEM_2M +   1 * MEM_4K, "foo2.1")
+    layout.add_region_payload(1 * MEM_2M +   3 * MEM_4K, 1 * MEM_2M +   4 * MEM_4K, "foo2.2")
+    layout.add_region_payload(1 * MEM_2M + 400 * MEM_4K, 1 * MEM_2M + 401 * MEM_4K, "foo2.400")
+    layout.add_region_payload(2 * MEM_2M +  23 * MEM_4K, 2 * MEM_2M +  24 * MEM_4K, "foo3.23")
+    layout.add_region_payload(3 * MEM_2M               , 3 * MEM_2M +   1 * MEM_4K, "foo4.1")
+
+    return layout
+
+def test1():
+    # pylint: disable=bad-whitespace
+    print("\033[33m### Test 1 ###\033[0m")
+
+
+    layout_usage = test_layout1()
+
+
+    print("\033[31m### Physical ###\033[0m")
+
+    physical_layer = Layer(layout_consts.LAYER_PHYSICAL_SECURE, True, 12, None)
+
+    physical_layout = PhysicalLayout(physical_layer, 0, MEM_1G, layout_usage, layout_consts.MemoryAttribute.CACHEABLE_WB)
+
+    layout_frames = [PartialGranuleFrame(MEM_4K,              0 * MEM_4K, physical_layout),
+                     PartialGranuleFrame(MEM_4K,              1 * MEM_4K, physical_layout),
+                     PartialGranuleFrame(MEM_4K, 1 * MEM_2M - 1 * MEM_4K, physical_layout),
+
+                     PartialGranuleFrame(MEM_2M, 1 * MEM_2M, physical_layout),
+                     PartialGranuleFrame(MEM_2M, 2 * MEM_2M, physical_layout),
+
+                     PartialGranuleFrame(MEM_4K, 3 * MEM_2M, physical_layout)]
+
+    print(physical_layer)
+
+
+    print("\033[31m### Stage 2 ###\033[0m")
+
+    stage2_layer = Layer("stage2", True, 12, 2, layout_consts.LAYER_PHYSICAL_SECURE)
+
+    stage2_mappings = [Stage2Page(stage2_layer, 3 * MEM_1G,              layout_frames[2]),
+                       Stage2Page(stage2_layer, 3 * MEM_1G + 1 * MEM_4K, layout_frames[1]),
+                       Stage2Page(stage2_layer, 3 * MEM_1G + 2 * MEM_4K, layout_frames[0]),
+                       Stage2Page(stage2_layer, 3 * MEM_1G,              layout_frames[3]),
+                       Stage2Page(stage2_layer, 3 * MEM_1G + 1 * MEM_2M, layout_frames[4]),
+                       Stage2Page(stage2_layer, 3 * MEM_1G + 2 * MEM_2M, layout_frames[5])]
+
+    print(stage2_layer)
+
+    stage2_granule_frames = [MatchingGranuleFrame(stage2_mappings[0]), # foo1.1
+                             MatchingGranuleFrame(stage2_mappings[1]), # foo1.2
+                             MatchingGranuleFrame(stage2_mappings[2]), # foo1.511
+
+                             AggregatingGranuleFrame(MEM_2M, [stage2_mappings[0],
+                                                              stage2_mappings[1],
+                                                              stage2_mappings[2]]),
+
+                             PartialGranuleFrame(MEM_4K,            0, stage2_mappings[3]), # foo2.1.1
+                             PartialGranuleFrame(MEM_4K,   3 * MEM_4K, stage2_mappings[3]), # foo2.1.2
+                             PartialGranuleFrame(MEM_4K, 400 * MEM_4K, stage2_mappings[3]), # foo2.1.400
+
+                             MatchingGranuleFrame(stage2_mappings[4]),
+                             MatchingGranuleFrame(stage2_mappings[5])]
+
+
+    print("\033[31m### Stage 1 ###\033[0m")
+
+    stage1_layer = Layer("stage1", True, 12, 1, "stage2")
+
+    stage1_mappings = [Stage1Page(stage1_layer, 1 * MEM_1G +                       0, stage2_granule_frames[2]),
+                       Stage1Page(stage1_layer, 1 * MEM_1G +              1 * MEM_4K, stage2_granule_frames[1]),
+                       Stage1Page(stage1_layer, 1 * MEM_1G +              2 * MEM_4K, stage2_granule_frames[0]),
+                       Stage1Page(stage1_layer, 1 * MEM_1G + 1 * MEM_2M,              stage2_granule_frames[3]),
+                       Stage1Page(stage1_layer, 1 * MEM_1G + 2 * MEM_2M,              stage2_granule_frames[4]),
+                       Stage1Page(stage1_layer, 1 * MEM_1G + 2 * MEM_2M + 1 * MEM_4K, stage2_granule_frames[5]),
+                       Stage1Page(stage1_layer, 1 * MEM_1G + 2 * MEM_2M + 2 * MEM_4K, stage2_granule_frames[6]),
+                       Stage1Page(stage1_layer, 1 * MEM_1G + 3 * MEM_2M,              stage2_granule_frames[7]),
+                       Stage1Page(stage1_layer, 1 * MEM_1G + 4 * MEM_2M,              stage2_granule_frames[8])]
+
+    print(stage1_layer)
+
+
+    print("\033[31m### PA-to-VA ###\033[0m")
+    for address_test in (0x001ff000 + 0xff,):
+        print("\033[32mtesting: {:#x}\033[0m".format(address_test))
+        for layer, address in physical_layout.get_address_higher(0x001ff000 + 0xff):
+            print(" - {}: {:#x}".format(layer.get_name(), address))
+
+def test2(stage2_size, stage1_size):
+    # pylint: disable=bad-whitespace
+    print("\033[33m### Test 2 ###\033[0m")
+
+    rand_gen = Random()
+    #rand_gen.seed(1234)
+
+    print("\033[32m--- preliminary ---\033[0m")
+
+    layout_usage = test_layout2()
+
+    print("\033[31m### Physical ###\033[0m")
+    physical_layer = Layer(layout_consts.LAYER_PHYSICAL_SECURE, True, 12, None, rand_gen=rand_gen)
+    physical_layer_preliminary = Layer(layout_consts.LAYER_PHYSICAL_SECURE, True, 12, None)
+    physical_layout = PreliminaryPhysicalLayout(physical_layer_preliminary, physical_layer, 0, MEM_1G, layout_usage, "fake-memattr")
+    physical_frame = PreliminaryFrame(physical_layout)
+    print(physical_layout)
+
+    print("\033[31m### Stage 2 ###\033[0m")
+    stage2_layer = Layer("stage2", True, 12, 2, rand_gen=rand_gen)
+    stage2_layer_preliminary = Layer("stage2", True, 12, 2)
+    stage2_layout = PreliminaryVirtualLayout(stage2_layer_preliminary, stage2_layer, 2 * MEM_1G, physical_frame, stage2_size, True)
+    stage2_frame = PreliminaryFrame(stage2_layout)
+    print(stage2_layout)
+
+    print("\033[31m### Stage 1 ###\033[0m")
+    stage1_layer = Layer("stage1", True, 12, 1, rand_gen=rand_gen)
+    stage1_layer_preliminary = Layer("stage1", True, 12, 1)
+    stage1_layout = PreliminaryVirtualLayout(stage1_layer_preliminary, stage1_layer, 1 * MEM_1G, stage2_frame, stage1_size, False)
+    print(stage1_layout)
+
+    encoding = getpreferredencoding()
+
+    print("\033[32m--- kaploded ---\033[0m")
+
+    stage1_layout.make_all_pages()
+
+    print("\033[31m### Physical ###\033[0m")
+    print(str(physical_layer).encode(encoding))
+
+    print("\033[31m### Stage 2 ###\033[0m")
+    print(str(stage2_layer).encode(encoding))
+
+    print("\033[31m### Stage 1 ###\033[0m")
+    print(str(stage1_layer).encode(encoding))
+
+
+    print("\033[32m--- randomized ---\033[0m")
+
+    print("\033[31m### Physical ###\033[0m")
+    physical_layer.reorder(RangeObject(start=0 << 30, end=1 << 64), True)
+    print(str(physical_layer).encode(encoding))
+
+    print("\033[31m### Stage 2 ###\033[0m")
+    stage2_layer.reorder(RangeObject(start=2 << 30, end=1 << 64), True)
+    print(str(stage2_layer).encode(encoding))
+
+    print("\033[31m### Stage 1 ###\033[0m")
+    stage1_layer.reorder(RangeObject(start=1 << 30, end=1 << 64), True)
+    print(str(stage1_layer).encode(encoding))
+
+if __name__ == "__main__":
+    MEM_4K = 0x1000
+    MEM_2M = 0x200000
+    MEM_1G = 0x40000000
+
+    test1()
+    #test2(MEM_4K, MEM_4K)
+    test2(MEM_4K, MEM_2M)
+    #test2(MEM_2M, MEM_4K)

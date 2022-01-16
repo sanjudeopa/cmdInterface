@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""
+Generate manifest file for a project
+"""
+import sys
+import json
+import hashlib
+import argparse
+
+from lib_gmp.gmp_consts import RUN_PROJECTS
+from lib_gmp.fastsim_command_constructor import get_fastsim_and_plugins_paths
+from lib_gmp.manifests import get_component_revisions_from_args, get_manifest_sha1_and_content, ManifestFileNotFound
+
+def parse_args():
+    """
+    Return namedtuple mapping the command line arguments
+    """
+    parser = argparse.ArgumentParser(description="Generate manifest file")
+    parser.add_argument("output", help="path to save the generated manifest")
+    parser.add_argument("--project_run",
+                        type=str,
+                        choices=RUN_PROJECTS,
+                        help="targetted project_run",
+                        required=True)
+
+    parser.add_argument("--use_pins_from",
+                        type=str,
+                        help="use pinned revisions from specified manifest branch")
+
+    parser.add_argument("--fastsim",
+                        type=str,
+                        default="auto",
+                        help="fastsim revision [<auto> | <warehouse revision> | <path>]")
+    parser.add_argument("--model_shell",
+                        type=str,
+                        default="auto",
+                        help="model_shell revision [<auto> | <warehouse revision> | <path>]")
+    parser.add_argument("--sve_plugin",
+                        type=str,
+                        default="auto",
+                        help="sve plugin revision [<auto> | <warehouse revision> | <path>]")
+    parser.add_argument("--crypto_plugin",
+                        type=str,
+                        default="auto",
+                        help="crypto plugin revision [<auto> | <warehouse revision> | <path>]")
+    parser.add_argument("--ete_plugin",
+                        type=str,
+                        default="auto",
+                        help="ete plugin revision [<auto> | <warehouse revision> | <path>]")
+    parser.add_argument("--tarmac",
+                        type=str,
+                        default="auto",
+                        help="tarmac plugin revision [<auto> | <warehouse revision> | <path>]")
+    parser.add_argument("--tarmactrace",
+                        type=str,
+                        default="auto",
+                        help="tarmactrace plugin revision [<auto> | <warehouse revision> | <path>]")
+    parser.add_argument("--tarmactext",
+                        type=str,
+                        default="auto",
+                        help="tarmactext plugin revision [<auto> | <warehouse revision> | <path>]")
+    parser.add_argument("--generictrace",
+                        type=str,
+                        default="auto",
+                        help="generictrace plugin revision [<auto> | <warehouse revision> | <path>]")
+    return parser.parse_args()
+
+def get_revision_pins(args, revisions):
+    "extract pinned revisions from manifest branch specified via --use_pins_from"
+    try:
+        _, revision_pins_content = get_manifest_sha1_and_content(args.use_pins_from, f"pins/{args.project_run}")
+    except ManifestFileNotFound:
+        # Ignore if pin file does not exist
+        return
+
+    revision_pins = json.loads(revision_pins_content)
+
+    for component, revision in revision_pins.items():
+        assert revisions.get(component) == "auto", f"Cannot pin revision for '{component}', custom value already specified"
+        revisions[component] = revision
+
+def main(args):
+    """
+    args: argparse Namespace, command line arguments
+    """
+    manifests = {}
+
+    revisions = get_component_revisions_from_args(args)
+
+    if args.use_pins_from:
+        get_revision_pins(args, revisions)
+
+    component_paths = get_fastsim_and_plugins_paths(args.project_run, revisions)
+    for component, path in component_paths.items():
+        with open(path, "rb") as fh:
+            file_hash = hashlib.sha256(fh.read()).hexdigest()
+        manifests[component] = {'path': path, 'hash': f'sha256:{file_hash}'}
+
+    with open(args.output, 'w') as fh:
+        json.dump(manifests, fh, indent=2)
+
+if __name__ == "__main__":
+    sys.exit(main(parse_args()))

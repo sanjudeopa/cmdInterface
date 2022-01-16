@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+
+"Set the file environment needed to run Popeye."
+
+import os
+import sys
+from argparse import ArgumentParser
+from subprocess import (
+        STDOUT,
+        CalledProcessError,
+)
+from configparser import ConfigParser
+
+from lib_shared.const_log import getStdoutLogger
+from lib_shared.popeye_common import query
+
+from lib_shared.resetenv import (
+        RevisionException,
+        check_call,
+        check_output,
+        is_stable,
+        is_ancestor,
+        reset,
+        makedirs,
+        symlink,
+        blk_setup,
+        update_submodules,
+        check_popeye,
+)
+
+LOGGER = getStdoutLogger()
+
+def check_dsu(project, config_reader, force=False, conservative=False, dsu_name='theodul'):
+    '''
+    Check that the revision of THEODUL_HOME is a direct descendant of
+    hard-coded Theodul's stable revision.
+    If not then propose checkouting this revision and updating the external
+    dependencies.
+    '''
+    path = os.getenv(f'{dsu_name.upper()}_HOME')
+    if not conservative:
+        if project == os.getenv("KLEIN_HOME"):
+            section = 'theodul_for_popeye'
+            reset(config_reader, section, path, force=force)
+        else:
+            reset(config_reader, dsu_name, path, force=force)
+
+    if project == os.getenv("KLEIN_HOME"):
+        section = 'theodul'
+        dsu_base_rev = config_reader.get(section, 'revision')
+        if is_stable(path, dsu_base_rev):
+            LOGGER.info('%s is at stable revision', dsu_name.upper())
+        elif is_ancestor(path, dsu_base_rev):
+            LOGGER.warning("Stable revision %s is an ancestor of the current one.", dsu_base_rev)
+            LOGGER.warning("Try again at this revision if problems are encountered.")
+        else:
+            LOGGER.error('%s is unstable. Please update %s_for_popeye.', dsu_name.upper(), dsu_name)
+            LOGGER.info('It is advised to check out or rebase on stable revision: %s', dsu_base_rev)
+            raise RevisionException("Failed to checkout Hayden as the revision is unstable.")
+
+
+    if force or conservative or query('Update external dependencies'):
+        deps = [
+                "sv_intf_tools",
+                "chi5pc",
+                "pc_shared_lib",
+                "sva_macros",
+                "vip_clk_reset",
+                "vip_sysco",
+                "vip_shared_lib",
+                "axi_ace5",
+                "axipc",
+                "acepc",
+                "vip4$", # Exclude vip4_lib_32 and vip4_lib_64
+                "vip5",
+                "apb5",
+                "axistream",
+                f"{dsu_name}_cpu_bridge",
+                "lpippc",
+                "lpiqpc",
+                "apbpc",
+                "atbpc",
+                "apb5",
+        ]
+
+        LOGGER.info("Updating Theodul external dependencies")
+        check_call(['./shared/bin/update_externals', '.externals',
+                    '--path', '.*({}).*'.format("|".join(deps))],
+                   cwd=path)
+
+proj2dsuname = {
+        os.getenv("KLEIN_HOME"): 'theodul',
+        os.getenv("HAYES_HOME"): 'hayden',
+        os.getenv("NEVIS_HOME"): 'hayden',
+        os.getenv("SENJO_HOME"): 'theodul',
+        os.getenv("BLUERIDGE_HOME"): 'hayden',
+}
+
+def update_project_dependencies(project, config_reader, force=False, conservative=False):
+    '''
+    Let the project update its dependencies itself.
+    '''
+
+    # TODO(salsah01, REL, put this in KLEIN/simulation/popeye/bin/update_dependencies)
+    if project in (os.getenv("KLEIN_HOME"), os.getenv("SENJO_HOME"), os.getenv("BLUERIDGE_HOME")):
+        try:
+            check_dsu(project, config_reader, force, conservative, proj2dsuname[project])
+        except CalledProcessError as ex:
+            raise RevisionException(f"Failed to checkout {proj2dsuname[project]}") from ex
+
+        elmer_home = os.environ.get("ELMER_HOME")
+        if elmer_home is not None:
+            cmd = ["./simulation/tlb_tb/tools/co_elmer"]
+            if force:
+                cmd += ["-f"]
+            try:
+                check_call(cmd, cwd=project)
+            except CalledProcessError as ex:
+                raise RevisionException("Failed to checkout Elmer") from ex
+        return
+
+    elif project in (os.getenv("HAYES_HOME"), os.getenv("NEVIS_HOME")):
+        cmd = ["shared/bin/get_dependencies", "popeye", "--exclude", "popeye"]
+        if force:
+            cmd += ["-f"]
+        try:
+            check_call(cmd, cwd=project)
+        except CalledProcessError as ex:
+            raise RevisionException(f"Failed to update {proj2dsuname[project]} extdeps") from ex
+        return
+
+    if project == os.getenv("GRIFFIN_HOME"):
+        cmd = ["./simulation/memsys_tb/bin/update_dependencies"]
+    else:
+        cmd = ["./simulation/popeye/bin/update_dependencies"]
+    if force:
+        cmd.append("--force")
+
+    LOGGER.info("Updating project dependencies")
+    check_call(cmd, cwd=project)
+
+def main(argv): # pylint: disable=too-many-statements,too-many-branches
+    "Create links and directories needed by Popeye."
+
+    parser = ArgumentParser(
+            prog='popeye_resetenv',
+            description="Reset environment to run Popeye.")
+
+    parser.add_argument(
+            "--source", "-s", action="store_true",
+            help="Only set environment variables, don't change files or links.")
+
+    parser.add_argument("--env", action="store_true",
+                        help="DEPRECATED; use -s/--source instead")
+
+    group = parser.add_mutually_exclusive_group()
+
+    group.add_argument(
+            '--conservative', '-c', action='store_true',
+            help='Set the environment, and do not affect current dependency revisions.')
+
+    group.add_argument(
+            '--force', '-f', action='store_true',
+            help='Force checkout if needed. BEWARE: loss of unsaved data might occur.')
+
+    parser.add_argument('--own-dependencies', action='store_true',
+                        help="Only update Popeye's own dependencies (not the RTL's)")
+
+    group.add_argument(
+            '--no-checkout', action='store_true',
+            help='Set the environment and the symlinks without touching the dependencies')
+
+    args = parser.parse_args(argv)
+
+    if args.env:
+        LOGGER.warning("DEPRECATED option --env; use -s/--source instead")
+        return 0
+
+    if args.source:
+        # Stop here, before files are touched.
+        return 0
+
+    for directory in ("logs", "compile_infos"):
+        makedirs(directory)
+
+    links = []
+    mth_home = os.environ.get('MTH_HOME')
+    hunter_home = os.environ.get('HUNTER_HOME')
+    if mth_home or hunter_home:
+        assert not (hunter_home and mth_home), "Both Hunter and Makalu homes can't be set, Please un-set one"
+        project = "hunter" if hunter_home else "makalu"
+        project_home = hunter_home if hunter_home else mth_home
+        dsu_name = 'theodul' if mth_home else 'hayden'
+        links += [(project_home, project)]
+
+    klein_home = os.environ.get('KLEIN_HOME')
+    hayes_home = os.environ.get('HAYES_HOME')
+    nevis_home = os.environ.get('NEVIS_HOME')
+    assert not (klein_home and hayes_home), "Both Klein and Hayes homes can't be set, Please un-set one"
+    if klein_home or hayes_home or nevis_home:
+        if klein_home:
+            links += [(klein_home, 'klein')]
+        elif hayes_home:
+            links += [(hayes_home, 'hayes')]
+        elif nevis_home:
+            links += [(nevis_home, 'nevis')]
+        dsu_name = 'theodul' if klein_home else 'hayden'
+        dsu_home = os.environ.get(f'{dsu_name.upper()}_HOME')
+        links.append((dsu_home, dsu_name))
+        assert dsu_home, f"Please clone {dsu_name} dependency and link it in the {dsu_name.upper()}_HOME environment variable"
+
+    griffin_home = os.environ.get('GRIFFIN_HOME')
+    if griffin_home is not None:
+        links += [(griffin_home, 'griffin')]
+
+    senjo_home = os.environ.get('SENJO_HOME')
+    if senjo_home is not None:
+        links += [(senjo_home, 'senjo')]
+        theodul_home = os.environ.get('THEODUL_HOME')
+        assert theodul_home, "Please clone Theodul dependency and link it in the THEODUL_HOME environment variable"
+
+    blueridge_home = os.environ.get('BLUERIDGE_HOME')
+    if blueridge_home is not None:
+        links += [(blueridge_home, 'blueridge')]
+        hayden_home = os.environ.get('HAYDEN_HOME')
+        assert hayden_home, "Please clone Hayden dependency and link it in the HAYDEN_HOME environment variable"
+        links.append((hayden_home, 'hayden'))
+        links += [(os.path.join(hayden_home, "logical/hayden_cpu_bridge"), 'hayden_cb')]
+
+    for target, name in links:
+        symlink(target, name)
+
+    blk_setup(overwrite=not args.no_checkout)
+
+    if args.no_checkout:
+        # Stop here, before files are touched.
+        return 0
+
+    try:
+        check_output(["blk_clean", "-r", "tools", "blkval"], stderr=STDOUT)
+    except CalledProcessError as e:
+        LOGGER.error("\n%s", e.output)
+        raise
+
+    if (senjo_home is not None) or (blueridge_home is not None):
+        deps = [os.path.join(os.getenv('MAIN_PROJECT_HOME'), 'testbench/popeye/misc/external_dependencies/external_dependencies.txt')]
+    elif hayes_home is not None or nevis_home is not None:
+        #REVISIT(leobel01, LAC.HYS, Remove once https://eu-gerrit-2.euhpc.arm.com/c/cpu/hayes/hayes/+/477855 gets merged)
+        if os.path.isfile(os.path.join(os.getenv('MAIN_PROJECT_HOME'), 'misc/external_dependencies/popeye_dependencies.ini')):
+            deps = [os.path.join(os.getenv('MAIN_PROJECT_HOME'), 'misc/external_dependencies/popeye_dependencies.ini')]
+        else:
+            deps = [os.path.join(os.getenv('MAIN_PROJECT_HOME'), 'misc/external_dependencies/external_dependencies.txt')]
+    else:
+        deps = [os.path.join(os.getenv('MAIN_PROJECT_HOME'), 'misc/external_dependencies/external_dependencies.txt')]
+
+    if griffin_home is None:
+        config_reader = ConfigParser()
+        config_reader.read(deps)
+    else: # No dependency checks for now with Griffin
+        config_reader = None
+
+
+    try:
+        update_submodules(force=args.force, conservative=args.conservative)
+        if config_reader is not None:
+            check_popeye(config_reader)
+        if args.own_dependencies:
+            # Don't check RTL's dependencies.
+            return 0
+
+        if not args.conservative and (config_reader is not None or griffin_home is not None):
+            update_project_dependencies(os.environ["MAIN_PROJECT_HOME"], config_reader, force=args.force, conservative=args.conservative)
+
+    except RevisionException as e:
+        LOGGER.error(e.args[0])
+        LOGGER.error("See %s for more information", deps)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

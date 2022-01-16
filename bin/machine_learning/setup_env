@@ -1,0 +1,28 @@
+#!/bin/tcsh
+
+source /arm/tools/setup/init/tcsh
+
+# Figure out POPEYE_HOME
+set script_path = `ls -l /proc/$$/fd | sed -e 's/^[^/]*//' | grep "/setup_env" | sed -e 's/\/setup_env//'`
+setenv POPEYE_HOME $script_path/../..
+
+unset script_path
+
+setenv DORY_WORK "$POPEYE_HOME/dory_work"
+
+source $POPEYE_HOME/bin/machine_learning/shared_setup
+mkdir -p "$DORY_WORK"
+
+echo "ML_PROJECT_NAME=$ML_PROJECT_NAME"
+echo "POPEYE_HOME=$POPEYE_HOME"
+echo "DORY_WORK=$DORY_WORK"
+
+if ($?PYTHONPATH) then
+  setenv PYTHONPATH "${PYTHONPATH}:${POPEYE_HOME}/bin/machine_learning:${POPEYE_HOME}/bin/machine_learning/popeye_ml"
+else
+  setenv PYTHONPATH "${POPEYE_HOME}/bin/machine_learning:${POPEYE_HOME}/bin/machine_learning/popeye_ml"
+endif
+
+setenv ML_HOME "${POPEYE_HOME}/bin/machine_learning"
+setenv PATH "${PATH}:${POPEYE_HOME}/bin"
+setenv LSB_DEFAULTPROJECT `$ML_HOME/popeye_ml/project_specific.py`

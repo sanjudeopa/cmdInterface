@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+
+"""
+Helper tool to manage lists of config lists
+
+default:
+    Generate a list of config lists
+
+if --check:
+    Test that ConfigListParser acts as expected by runnig it multiple times
+
+    It happens that users of the FPGA web interface interrupt the generation of tests
+    from the list of configurations, the option '--interrupt' is here to reproduce
+    this behavior
+"""
+
+
+import os
+import pickle
+import sys
+import random
+import argparse
+from pathlib import Path
+
+from collections import defaultdict
+
+from lib_gmp.gmp_consts import PROJECTS
+from lib_gmp.regr_list_parser import ConfigListParser
+from lib_shared.config_requirements import get_default_requirements
+
+
+def get_args():
+    "Parse the command line arguments"
+
+    def range_int(minval, maxval):
+        def range_int_type(val):
+            i_val = int(val)
+            if minval <= i_val <= maxval:
+                return i_val
+            else:
+                raise argparse.ArgumentTypeError("Value has to be between {} and {}".format(minval, maxval))
+        return range_int_type
+
+    parser = argparse.ArgumentParser(description='Helper tool to manage lists of config lists')
+    parser.add_argument("--project",
+                        type=str,
+                        choices=PROJECTS,
+                        help="targetted project")
+    parser.add_argument("--nb_test",
+                        type=range_int(1, 1000000),
+                        default=1000,
+                        required=False,
+                        help="number of config item to generate (default: 1000)")
+    parser.add_argument("--seed",
+                        type=int,
+                        default=random.randrange(1 << 32),
+                        help="specify a seed to have reproducible output")
+    parser.add_argument("--test_list",
+                        type=str,
+                        nargs="+",
+                        default=["default_asm.list"],
+                        help="test config list file name to use")
+    parser.add_argument("--force_configs",
+                        type=str,
+                        nargs="+",
+                        default=[],
+                        help="configuration files that are always added at the end")
+    parser.add_argument("--filter_config",
+                        type=str,
+                        nargs="+",
+                        default=[],
+                        help="only configuration files which should be generated")
+    parser.add_argument("--xfilter_config",
+                        type=str,
+                        nargs="+",
+                        default=[],
+                        help="configuration files that should not be generated")
+    parser.add_argument("--xfilter_list",
+                        type=str,
+                        nargs="+",
+                        default=[],
+                        help="list of configuration files that should not be generated")
+    parser.add_argument("--follow",
+                        action="store_true",
+                        help="Save/restore random state between invocations (same seed must be specified)")
+
+    parser.add_argument("--check",
+                        action="store_true",
+                        required=False,
+                        help="Enable the lists config checker")
+    parser.add_argument("--nb_draw",
+                        type=range_int(10, 10000),
+                        default=10,
+                        required=False,
+                        help="Number of draws (default: 10)")
+    parser.add_argument("--interrupt",
+                        action="store_true",
+                        required=False,
+                        help="Simulate the user interruption of the tests list creation")
+
+    parser.add_argument("--print_test_lists",
+                        action="store_true",
+                        required=False,
+                        help="List available test config lists")
+
+    args = parser.parse_args()
+    return args
+
+
+def draw_test(args, regr_lists_dir):
+    """
+    Create the tests lists draws
+    """
+
+    result_list = defaultdict(int)
+
+    for _ in range(args.nb_draw):
+        # Create the config list
+        config_list = get_cfg_list_parser(args, regr_lists_dir)
+
+        current_list = defaultdict(int)
+
+        # If it has to be interrupted, choose when
+        if args.interrupt:
+            stop = random.randint(1, args.nb_test)
+        else:
+            stop = args.nb_test + 1
+
+        # Simulate the creation of the tests' list configurations for a regression
+        # test
+        for _ in range(stop):
+            elem = config_list.get_next()
+
+            # defaultdict allows to add the element or increment it's value
+            # either it already exist or not
+            current_list[elem] += 1
+
+        # Add the result of the current "simulation" to the global list
+        for elem in current_list:
+            result_list[elem] += current_list[elem]
+
+
+    return result_list
+
+
+def print_results(args, regr_lists_dir, result_list):
+    """
+    Print the test result
+    """
+
+    # Create the config list
+    config_list = get_cfg_list_parser(args, regr_lists_dir)
+    expected_list = config_list.list_choice.all_options_d
+
+    # The /100 is to get the % instead of 0.___ ((a/b)*100 == a/(b/100))
+    sum_weight = sum(expected_list.values()) / 100
+    res_sum = sum(result_list.values()) / 100
+
+    print("| expected % | real % | Options list")
+
+    for key, val in expected_list.items():
+        print("|   {:5.2f}    | {:5.2f}  | {}".format(val/sum_weight, result_list[key]/res_sum, key))
+
+
+def check_distribution(args, regr_lists_dir):
+    """
+    Main function for the distribution check
+    """
+    result_list = draw_test(args, regr_lists_dir)
+
+    print_results(args, regr_lists_dir, result_list)
+
+
+def create_config_list(args, regr_lists_dir):
+    """
+    Main function for the config list creation
+    """
+    config_list_parser = get_cfg_list_parser(args, regr_lists_dir)
+
+    for _ in range(args.nb_test):
+        config_combination = list(config_list_parser.get_next())
+        config_combination += args.force_configs
+
+        print(*config_combination)
+
+
+def get_cfg_list_parser(args, regr_lists_dir):
+    """
+    Create the config_list_parser
+    """
+
+    xfilter_list = [regr_lists_dir / "default.xfilter_list"]
+
+    assert args.project is not None, "--project must be specified"
+
+    project_xfilter_list = regr_lists_dir / f"{args.project}.xfilter_list"
+    if os.path.exists(project_xfilter_list):
+        xfilter_list.append(project_xfilter_list)
+
+    for xlist in args.xfilter_list:
+        xfilter_list.append(regr_lists_dir / xlist)
+
+    config_list_parser = ConfigListParser(
+            [regr_lists_dir / test_list for test_list in args.test_list],
+            xfilter_list,
+            args.filter_config,
+            args.xfilter_config,
+            get_default_requirements(args.project, "genasm_mp"),
+    )
+
+    return config_list_parser
+
+def print_test_lists(regr_lists_dir):
+    """
+    Print available test lists in $POPEYE_HOME
+    """
+    test_lists = (
+            os.path.relpath(os.path.join(root, f), regr_lists_dir)
+            for root, dirs, files in os.walk(regr_lists_dir)
+            for f in files
+            if f.endswith(".list")
+    )
+
+    for test_list in test_lists:
+        print(test_list)
+
+def main():
+    """ Main function """
+    args = get_args()
+
+    regr_lists_dir = Path(os.environ['POPEYE_HOME']) / 'regression' / 'genasm_mp'
+
+    random.seed(args.seed)
+
+    follow_file_path = ".gmp_config_list_state"
+
+    if os.path.exists(follow_file_path):
+        if args.follow:
+            with open(follow_file_path, "rb") as state_fd:
+                pickled_seed, pickled_state = pickle.load(state_fd)
+                if pickled_seed == args.seed:
+                    random.setstate(pickled_state)
+        else:
+            os.unlink(follow_file_path)
+
+
+    if args.print_test_lists:
+        print_test_lists(regr_lists_dir)
+    elif args.check:
+        check_distribution(args, regr_lists_dir)
+    else:
+        create_config_list(args, regr_lists_dir)
+
+    if args.follow:
+        with open(follow_file_path, "wb") as state_fd:
+            pickled = (args.seed, random.getstate())
+            pickle.dump(pickled, state_fd)
+
+if __name__ == "__main__":
+    sys.exit(main())

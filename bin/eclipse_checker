@@ -1,0 +1,110 @@
+#!/bin/bash
+# shellcheck disable=SC2016
+
+#Note : This script must be run from Popeye directory
+
+echo ""
+
+#Check to run script from right location
+if [ ! -f ".blk_setup" ]; then
+    echo "**Error**: Please run this script from Popeye repository root after setupTB has been run."
+    exit
+fi
+
+#User inputs of run directory and arguments
+usage()
+{
+  echo "**Error**"
+  echo "Correct usage for $0:"
+  echo "    -r <path to run directory relative to POPEYE_HOME>";
+  echo "    -a <string of arguments to the checker. Will be picked from rundir if unspecified.>";
+  exit 1;
+}
+
+#Set Defaults
+rundir="simulate/interactive/"
+arguments=""
+currdir=$(pwd)
+workspace="$currdir/.."
+
+while getopts "r:a:" a; do
+  case "${a}" in
+    r)
+      rundir="${OPTARG}"
+      ;;
+    a)
+      arguments="${OPTARG}"
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [ "$arguments" == "" ]; then
+  arguments=$(grep data_checker "$rundir"/blk_val.log | grep project | grep foreground | tr -s " " | cut -d " " -f3-)
+fi
+
+project=$(echo "$arguments" | cut -d " " -f2)
+
+echo "#############################################"
+echo "Setting up with following:"
+echo "project=$project"
+echo "rundir=$rundir"
+echo "arguments=$arguments"
+echo "#############################################"
+echo ""
+
+if [ "$arguments" == "" ]; then
+  echo "##############******Error***##################"
+  echo "Arguments could not be found. Please check rundir and ensure that it contains foreground script to run checkers."
+  echo "Exiting without launching eclipse."
+  echo "#############################################"
+  exit
+fi
+
+cd "$rundir" || exit
+foreground_file_path=$(find . -name "*data_checker*" | grep -v evs)
+cd - || exit
+
+rm -rf "$HOME"/.eclipse
+rm -rf eclipse
+
+if [[ -d "$HOME/.eclipse/" || -d "eclipse" ]]; then
+  echo "##############******Error***##################"
+  echo "Could not remove ~/.eclipse and eclipse directories."
+  echo "Multiple Eclipse sessions cannot be launched."
+  echo "Please close all eclipse sessions and retry. If problem still persist try killing stale java processes."
+  existing_processes=$(pgrep java)
+  if [ "$existing_processes" != "" ]; then
+    echo "Check if any of these should be killed:"
+    pgrep java
+  fi
+  echo "Exiting without launching eclipse."
+  echo "#############################################"
+  exit
+fi
+
+cp -r /arm/projectscratch/pd/zermatt_shared/sync/popeye/eclipse_setup eclipse
+cp bin/data_checker bin/data_checker.py
+
+sed -i "s/WORKSPACE_PATH/${workspace//\//\\/}/g" eclipse/.metadata/.plugins/org.eclipse.debug.core/.launches/MyChecker.launch
+sed -i "s/RUNDIR_PATH/${rundir//\//\\/}/g" eclipse/.metadata/.plugins/org.eclipse.debug.core/.launches/MyChecker.launch
+sed -i "s/PROJECT_NAME/${project}/g" eclipse/.metadata/.plugins/org.eclipse.debug.core/.launches/MyGenerator.launch
+sed -i "s/ARGUMENT_LIST/${arguments//\//\\/}/g" eclipse/.metadata/.plugins/org.eclipse.debug.core/.launches/MyChecker.launch
+sed -i "s/RUNCONFIG/MyChecker/g" eclipse/.metadata/.plugins/org.eclipse.debug.ui/launchConfigurationHistory.xml
+sed -i "s/.*EXIT/#&/" "$rundir"/"$foreground_file_path"/foreground
+sed -i 's/mkdir -v/rm -rf \"${dir}\" ; mkdir -v/' "$rundir"/"$foreground_file_path"/foreground
+
+cd "$rundir" || exit
+./"$foreground_file_path"/foreground
+cd - || exit
+
+echo "#############################################"
+echo "Setup is Complete. Wait for Eclipse to Open."
+echo "#############################################"
+echo ""
+echo ""
+
+dvt.sh -workspace eclipse &

@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+# pylint: disable=missing-docstring
+
+import os
+import argparse
+import sys
+
+from lib_gmp.term_scroll import TermScroll
+from lib_gmp.regr_result import RegrResult
+
+def get_args():
+    "generate and execute the argument line parser"
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--verbose", "-v", action="count", default=0)
+    parser.add_argument("--verbose_limit", "-l", type=int, default=10)
+    parser.add_argument("--compact", "-c", help="This option is deprecated")
+    parser.add_argument("--raw", "-n", action="store_true", help="Print names of failed tests without formatting")
+    parser.add_argument("--check_item", "-i", type=str,
+                        help="Only print informations related to specified check item "
+                             "(eg. genasm_mp_result --check_item fastsim_failure)")
+    parser.add_argument("--path", "-p", type=str, help="POPEYE path")
+    parser.add_argument("--ignore", type=str, action="append",
+                        help="Don't update return code for failures related to specified check item "
+                             "(eg. genasm_mp_result --ignore generation_exception)")
+    parser.add_argument("--exclude", type=str, action="append",
+                        help="Same as --ignore, and also don't print check item and related failures")
+    parser.add_argument("--target", type=str, help="Final step that tests are supposed to reach")
+    parser.add_argument("--xml", action="store_true", help="Dump junit xml for continuous integration")
+    parser.add_argument("--nocolor", action="store_true", help="Disable colored output")
+    parser.add_argument("--dir", type=str, default="genasm_mp", help="subdirectory containing all generated files")
+    return parser.parse_args()
+
+def main():
+    "main function to invoke the evaluation of the regression result"
+
+    args = get_args()
+    popeye_path = args.path if args.path else os.environ.get("POPEYE_HOME")
+
+    if not popeye_path:
+        sys.stderr.write("need $POPEYE_HOME environment variable or --path argument\n")
+        return -1
+
+    with TermScroll(sys.stdout) as ts:
+        genasm_path = os.path.join(popeye_path, args.dir)
+
+        regr_result = RegrResult(genasm_path)
+        regr_result.get_check_objects(args.check_item)
+        regr_result.count_json_statistics(ts)
+        retcode = regr_result.print_statistics(ts.out,
+                                               args.exclude,
+                                               args.ignore,
+                                               args.target,
+                                               args.verbose,
+                                               args.verbose_limit,
+                                               not args.nocolor,
+                                               args.raw)
+        if args.xml:
+            regr_result.dump_junit_xml(args.dir)
+
+    return retcode
+
+if __name__ == "__main__":
+    sys.exit(main())

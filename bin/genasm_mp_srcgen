@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""
+Generate C source files in sync with Python structures
+Option `--check` can be used to ensure files are up-to-date
+"""
+
+import os
+import sys
+import difflib
+import argparse
+
+from lib_gmp.infoblock import GlobalInfoblock
+from lib_gmp.enums import Enums
+
+def main(args):
+    """
+    main function looping over files and generation functions
+    """
+    gen_functions = {
+            "global_infoblock.gen.h": GlobalInfoblock.dump_c_file,
+            "g_enums.gen.h": Enums.dump_c_header,
+            "g_enums.gen.c": Enums.dump_c_source,
+    }
+
+    returncode = 0
+
+    for name, func in gen_functions.items():
+        gen_file = os.path.join(os.getenv("POPEYE_HOME"), "include", "src", name)
+        generated_lines = ["// WARNING: do not modify by hand, use `genasm_mp_srcgen` to regenerate\n"]
+        generated_lines += func()
+
+        if args.check:
+            with open(gen_file) as gen_fd:
+                existing_lines = gen_fd.readlines()
+                diff = difflib.unified_diff(existing_lines, generated_lines, name, name)
+                try:
+                    line = next(diff)
+
+                    # Differences found, report error
+                    returncode = 1
+                    sys.stdout.write(line)
+                    sys.stdout.writelines(diff)
+                except StopIteration:
+                    # Iterator was empty -> no diff
+                    pass
+        else:
+            with open(gen_file, "w") as gen_fd:
+                gen_fd.writelines(generated_lines)
+
+    return returncode
+
+def get_args():
+    """
+    helper function to instantiate an L{ArgumentParser}
+
+    @return: a L{namedtuple} instance containing the parsed command line options
+    """
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--check", action="store_true", help="Return non-zero value if generated files are not up-to-date")
+
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    sys.exit(main(get_args()))

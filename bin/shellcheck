@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+
+# Run ShellCheck on files passed as arguments.
+# $ ./bin/shellcheck [FILE ...]
+# By default run on all files that look like shell scripts in the whole
+# repository.
+main () {
+    set -euo pipefail
+    . /arm/tools/setup/lib/sh
+    declare -a files
+
+    if ! module load swdev git/git/2.18.0 shellcheck/shellcheck/0.7.0; then
+        printf 'Need to bsub on a RHEL7 machine:\n'
+        printf '$ bsub -q inter -I -R '"'"'select[rhe7 && os64]'"'"' -P PJ02794 %s %s\n' "$0" "$*"
+        exit 1
+    fi
+
+    if (( $# > 0 )); then
+        files=("$@")
+    else
+        pushd "$(git rev-parse --show-toplevel)"
+        # readarray: put lines of stdin in an array.
+        # comm -23: keep lines appearing only in the first list:
+        # - first list: sh or bash scripts or files containing 'shellcheck';
+        # - second list: files containing '^# shellcheck: ignore'.
+        readarray -t files < <(comm -23 \
+            <(git grep -lE '^#!/(bin/|usr/bin/env )(ba)?sh|shellcheck') \
+            <(git grep -lE '# shellcheck: ignore'))
+        files+=(bin/shellcheck)
+    fi
+
+    shellcheck -V
+    printf '\nShellCheck will run on the following files:\n'
+    printf '    %s\n' "${files[@]}"
+    printf '\n'
+
+    shellcheck -e SC1090 -e SC1091 -e SC1094 -x "${files[@]}" -P SCRIPTDIR
+}
+
+main "$@"

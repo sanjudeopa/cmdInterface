@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+
+if (( "$#" < 1 )); then
+  echo "Usage: $0 DB_PATH" >&2
+  exit 1
+fi
+
+db="$1"
+if ! [ -f "${db}" ]; then
+  echo "$0: no such file"
+  exit 1
+fi
+
+
+# Schemas:
+
+# v1
+# TABLE transactions (
+#   seq_nb INTEGER NOT NULL,
+#   tr_nb INTEGER NOT NULL,
+#   agent_id INTEGER NOT NULL,
+#   type CHARACTER NOT NULL,
+#   id INTEGER NOT NULL,
+#   ts_b INTEGER,
+#   ts_e INTEGER,
+#   space TEXT DEFAULT '',
+#   addr INTEGER,
+#   value INTEGER
+# )
+
+# v2
+# TABLE operations (
+#   seq_nb INTEGER NOT NULL,
+#   agent_id INTEGER NOT NULL,
+#   type INTEGER NOT NULL,
+#   id TEXT DEFAULT '',
+#   ts_b INTEGER,
+#   ts_e INTEGER,
+#   space TEXT DEFAULT '',
+#   addr INTEGER,
+#   value INTEGER
+# )
+
+sqlite3 "${db}" << EOS
+  CREATE TABLE transactions (seq_nb INTEGER NOT NULL, tr_nb INTEGER NOT NULL,
+    agent_id INTEGER NOT NULL, type CHARACTER NOT NULL, id INTEGER NOT NULL,
+    ts_b INTEGER, ts_e INTEGER, space TEXT DEFAULT '', addr INTEGER,
+    value INTEGER);
+  INSERT INTO transactions
+  SELECT operations.ROWID, operations.ROWID, agent_id,
+    CASE WHEN s = "W" AND value IS NULL THEN "U" ELSE s END, CAST(operations.id AS INTEGER),
+    ts_b, ts_e, space, addr, value
+  FROM operations,
+    (
+      SELECT 0x00 AS i, "R" AS s UNION ALL
+      SELECT 0x01, "R" UNION ALL
+      SELECT 0x02, "R" UNION ALL
+      SELECT 0x10, "R" UNION ALL
+      SELECT 0x11, "R" UNION ALL
+      SELECT 0x12, "R" UNION ALL
+      SELECT 0x20, "R" UNION ALL
+      SELECT 0x21, "R" UNION ALL
+      SELECT 0x50, 'W' UNION ALL
+      SELECT 0x51, 'W' UNION ALL
+      SELECT 0x60, 'W' UNION ALL
+      SELECT 0x61, 'W' UNION ALL
+      SELECT 0x70, 'W' UNION ALL
+      SELECT 0x71, 'W' UNION ALL
+      SELECT 0xb0, 'C' UNION ALL
+      SELECT 0xb1, 'D' UNION ALL
+      SELECT 0xb2, 'B' UNION ALL
+      SELECT 0xc0, 'B' UNION ALL
+      SELECT 0xc1, 'B'
+    )
+  WHERE type = i
+  ORDER BY operations.ROWID;
+
+  CREATE INDEX transaction_idx_type ON transactions (type);
+  CREATE INDEX transaction_idx_saas ON transactions (space, addr, agent_id,
+    seq_nb, tr_nb);
+EOS

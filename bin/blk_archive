@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# shellcheck: ignore
+
+dir=${1%/}
+
+if ! [ -d "${dir}" ]
+then
+    echo "Error: '${dir}' is not a valid directory"
+    exit 1
+fi
+
+DSU_NAMES_L=(theodul hayden)
+dsu=${2%/}
+
+(
+for i in ${DSU_NAMES_L[@]}
+do
+    [[ "${i}" == "${dsu}" ]] && exit 0
+done
+) || { echo "Error: '${dsu}' is not a supported DSU type (${DSU_NAMES_L[@]})" ; exit 1 ; }
+
+set -x
+
+run_verdi="${dir}/run_verdi"
+
+cat << EOF > "${run_verdi}"
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+main () {
+    if ! command -v module >/dev/null 2>&1; then
+        . /arm/tools/setup/lib/sh
+    fi
+    set -x
+    export UNIVENT_PATH=${UNIVENT_PATH}
+    export CORINTH_SRC=${dsu}
+    export CORINTH_HOME=${dsu}/shared
+    export VIP_AXI_STREAM_SV_HOME=lib/vip/axi4stream/sv
+    module load eda synopsys/verdi3/2020.12-SP2-2
+    verdi -ssf dump.vf -f build.vc -nologo -ssv -ssy -usemti -sv -2012 +define+MODEL_TECH +libverbose -uvm -rcFile popeye_verdi.rc
+}
+
+main "$@"
+EOF
+
+chmod +x "${run_verdi}"
+
+files="$(mktemp)"
+find "${dir}" -type f > "${files}"
+echo "${dir}/m4ified" >> "${files}"
+echo "${dir}/mdsgen" >> "${files}"
+echo "${dir}/${PROJ_NAME}/misc" >> "${files}"
+echo "${dir}/build.vc" >> "${files}"
+echo "${dir}/lib" >> "${files}"
+
+
+for dir_name in ${dsu} ${dsu}/shared
+do
+    for sub_dir_name in logical verilog
+    do
+        dir_name_full="${dir}/${dir_name}/${sub_dir_name}"
+        if [ -d "${dir_name_full}" ]
+        then
+            echo "${dir_name_full}" >> "${files}"
+        fi
+    done
+done
+
+archive="${dir}.tgz"
+tar --create --gzip --verbose --dereference --file "${archive}" -T "${files}" --exclude-vcs --exclude docs
+
+rm "${files}"
+
+echo "Done. (${archive})"

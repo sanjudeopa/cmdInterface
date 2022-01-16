@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+
+"script to parse a text snipped containing a test name and reverse the hashed config names if necessary"
+
+import sys
+import os
+import argparse
+import subprocess
+
+from lib_gmp.test_name_handler import TestName
+from lib_gmp.test_history import get_last_test_name
+
+def parse_args():
+    "parses the command line arguments and returns a named tuple with all argument values"
+
+    parser = argparse.ArgumentParser(epilog="All other arguments will be added to the result command, unchanged")
+    parser.add_argument('testname', nargs="?", help='test name snippet')
+    parser.add_argument("--run", action="store_true", help="print the command and run it")
+    parser.add_argument("--nocheckout", action="store_true", help="If running don't checkout anyhow")
+    parser.add_argument("--dir", default="genasm_mp", help="Subdirectory containing all generated files")
+    return parser.parse_known_args()
+
+def get_full_git_rev(path, rev):
+    "returns the full git SHA1 for a given revision or None if the revision is not found"
+    try:
+        return subprocess.check_output(["git", "-C", path, "rev-parse", rev],
+                                       stderr=subprocess.PIPE,
+                                       universal_newlines=True).strip()
+    except subprocess.CalledProcessError:
+        return None
+
+def main(args, additional_args_l):
+    "main function to run the test name parsing"
+
+    extracted = TestName.extract(args.testname or get_last_test_name(args.dir))
+
+    popeye_path = os.getenv("POPEYE_HOME")
+    gitsha1 = get_full_git_rev(popeye_path, extracted.gitsha1)
+
+    if extracted.gitdirty:
+        print("# WARNING: original test was generated with local changes, might not be reproducible")
+
+    if gitsha1 is None:
+        print("# WARNING: revision used for generation not found in working tree")
+
+    command = ["genasm_mp",
+               "--project", extracted.project,
+               "--seed", str(extracted.seed),
+               "--nb_cpu", str(extracted.cpus)]
+
+    rnbfm = extracted.rnbfms
+    if rnbfm > 0:
+        command += ["--nb_rn_bfm", str(rnbfm)]
+
+    acp = extracted.acps
+    if acp:
+        command += ["--nb_acp", str(acp)]
+
+    project_core = extracted.project_cores
+    if project_core:
+        command.append("--project_core")
+        command.extend(project_core)
+
+    clusters = extracted.clusters
+    if clusters > 1:
+        command.extend(("--nb_cluster", str(clusters)))
+    threads = extracted.threads
+    if threads > 1:
+        command.extend(("--threads_per_cpu", str(threads)))
+
+    configs = extracted.configs
+    if configs:
+        command.append("--configs")
+        command.extend(configs)
+
+    git_checkout = gitsha1 is not None and gitsha1 != get_full_git_rev(popeye_path, "HEAD")
+
+    command += additional_args_l
+
+    if args.run:
+        command += ["--dir", args.dir]
+        if git_checkout and not args.nocheckout:
+            subprocess.call(["git", "-C", popeye_path, "checkout", gitsha1])
+        return subprocess.call(command)
+    else:
+        if git_checkout and not args.nocheckout:
+            print("git checkout {}".format(gitsha1))
+        print(" ".join(command))
+
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main(*parse_args()))

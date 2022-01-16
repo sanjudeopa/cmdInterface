@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"Create a popeye.elf from a JSON file."
+
+import sys
+import argparse
+import json
+from struct import pack, calcsize
+
+import fv
+
+from lib_generator.elf import ElfWriter, SECTION_ID_TRS, SECTION_ID_CONFIG, SECTION_ID_INDEX, SECTION_ID_RANGE
+
+from lib_shared.popeye_common import unhexlify_be
+
+def dump_config(elf_writer, json_data):
+    "Add the config section of L{json_data} to the L{elf_writer}."
+
+    for section_name, config_section in json_data.get("config", {}).items():
+        elf_writer.add_binary_section(name=section_name,
+                                      data=fv.dumps(config_section),
+                                      section_type=SECTION_ID_CONFIG)
+
+def dump_trs(elf_writer, json_data):
+    "Add the TRS section of L{json_data} to the L{elf_writer}."
+
+    for section_name, trs_section in json_data.get("trs", {}).items():
+        offsets = bytearray()
+        data = bytearray()
+        for index, trs in enumerate(trs_section):
+            trs.pop("id", None) # drop the "id" attribute
+            label = trs.pop("label", None)
+            if label:
+                elf_writer.add_symbol(name=str(label),
+                                      value=index,
+                                      section=section_name)
+            for name in ["data", "strb", "compare"]:
+                item = trs.pop(name, None)
+                if item:
+                    trs[name] = unhexlify_be(item)
+
+            offsets += pack("<Q", len(data))
+            data += fv.dumps(trs)
+
+        elf_writer.add_binary_section(name=section_name,
+                                      data=data,
+                                      executable=True,
+                                      section_type=SECTION_ID_TRS)
+        elf_writer.add_binary_section(name=section_name.replace(".trs.", ".index."),
+                                      data=offsets,
+                                      entry_size=8,
+                                      section_type=SECTION_ID_INDEX)
+
+def dump_ranges(elf_writer, json_data):
+    "Add the payload ranges section of L{json_data} to the L{elf_writer}."
+
+    for section_name, ranges_section in json_data.get("ranges", {}).items():
+        ranges = bytearray()
+        regions_count = 0
+        regions = bytearray()
+        strings = bytearray()
+
+        for payload_name, payload_ranges in ranges_section.items():
+            region_count = len(payload_ranges)
+            ranges += pack("<QQQ",
+                           regions_count,
+                           region_count,
+                           len(strings))
+            regions_count += region_count
+            for start, end in payload_ranges:
+                regions += pack("<QQ", start, end)
+            strings += payload_name.encode("ascii", "ignore")
+            strings.append(0)
+
+        range_table_offset = calcsize("<QQQQ") # size of the header that will be created below
+        region_table_offset = range_table_offset + len(ranges)
+        string_table_offset = region_table_offset + len(regions)
+
+        data = bytearray()
+        data += pack("<QQQQ",
+                     len(ranges_section),
+                     range_table_offset,
+                     region_table_offset,
+                     string_table_offset)
+        data += ranges
+        data += regions
+        data += strings
+
+        elf_writer.add_binary_section(name=section_name,
+                                      data=data,
+                                      section_type=SECTION_ID_RANGE)
+
+def main(args):
+    "Create a popeye.elf from a JSON file."
+    json_data = json.load(args.json)
+    elf_writer = ElfWriter(entry_point=0)
+
+    dump_config(elf_writer, json_data)
+    dump_trs(elf_writer, json_data)
+    dump_ranges(elf_writer, json_data)
+
+    elf_writer.dump(args.elf)
+
+def get_args():
+    "parses the command line arguments and returns them in a named tuple"
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("json", type=argparse.FileType('r'))
+    parser.add_argument("elf", type=argparse.FileType('wb'))
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    sys.exit(main(get_args()))

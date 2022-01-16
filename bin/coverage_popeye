@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+
+# instead of launching a python tool directly
+#     mytool --foo --bar=42
+# launch it through
+#     coverage_popeye mytool --foo --bar=42
+# resolve the absolute path of the python tool to be checked.
+# if this wasn't done, pycov would search for a python module called "mytool"
+# instead of an executable script in the PATH
+
+TOOL="$(command -v "$1")"
+shift
+mkdir -p "$POPEYE_HOME/pycov_collection/"
+exec python3 -m coverage run "--rcfile=$POPEYE_HOME/tools/infra/pycov/pycovrc" "$TOOL" "$@"

@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+#Examples for usage:
+#default:               genasm_mp_bsub genasm_mp --project klein --nb_cpu ...........
+#with bsub parameters:  genasm_mp_bsub -P xxxx -R yyyy -W ... -q ... -Jd ... genasm_mp --project klein --nb_cpu ...........
+if [[ $1 =~ '-' ]]
+#if a '-' is passed, it means that some lsf parameters have been passed. if not, then else contains the default values
+then
+    while getopts ":P:R:W:q:Jd:" opt; do
+    #opt contains the arguments passed with any of the cmd line options in current iteration.
+    #case compares it assigns it to the respective variable (P,R,R,q,Jd: lsf parameters)
+    case $opt in
+        P) P="$OPTARG"
+        ;;
+        R) R="$OPTARG"
+        ;;
+        W) W="$OPTARG"
+        ;;
+        q) q="$OPTARG"
+        ;;
+        d) Jd="$OPTARG"
+        ;;
+        J)
+        ;;
+        \?) echo "Invalid option -$OPTARG" >&2
+        ;;
+    esac
+    done
+    shift $((OPTIND-1))
+
+    proj=${P:-'PJ1100048'}
+    proj_l_case=${proj,,}
+    resource=${R:-'rhe7'}
+    run_time=${W:-5}
+    queue=${q:-'PD'}
+    job_desc=${Jd:-'top_val'}
+
+    echo -e "\nbsub -I -sp 90 -R" "$resource" "-W" "$run_time" "-P" "$proj" "-q" "$queue" "-Jd" "$job_desc" "-g /cpg/""${proj_l_case}""/sim/top/ris/genasm-mp/reset" "$@"
+    bsub -I -sp 90 -R "$resource" -W "$run_time" -P "$proj" -q "$queue" -Jd "$job_desc" -g /cpg/"${proj_l_case}"/sim/top/ris/genasm-mp/reset "$@"
+
+else
+    echo -e "\nbsub -I -sp 90 -R rhe7 -W 5 -P PJ1100048 -q PD -Jd top_val -g /cpg/pj1100048/sim/top/ris/genasm-mp/reset " "$@"
+    bsub -I -sp 90 -R rhe7 -W 5 -P PJ1100048 -q PD -Jd top_val -g /cpg/pj1100048/sim/top/ris/genasm-mp/reset "$@"
+fi

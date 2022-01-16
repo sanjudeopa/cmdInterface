@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+'''
+Run the execution model on the generated test.
+'''
+
+import argparse
+import sys
+import pickle
+
+from lib_execution_model.execution_model import ExecutionModel
+
+from lib_shared.const_log import getStdoutLogger, setLevel
+
+from lib_generator.const_tbench import Constants
+
+LOGGER = getStdoutLogger()
+
+def parse_args():
+    'Define and parse the arguments of the exec_model'
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("-v", dest="verbose_level", type=int, default=0)
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable profiling of the exec_model")
+    parser.add_argument("--pudb", action="store_true",
+                        help="Launch with awesome python debugger")
+    parser.add_argument("--debugpy", type=int,
+                        help="Launch with remote capable python debugger")
+
+    return parser.parse_args()
+
+def main():
+    '''
+    Run the execution model on the generated test.
+    '''
+    if args.verbose_level > 0:
+        setLevel(max(10 - args.verbose_level, 0))
+
+    if args.pudb:
+        import pudb # pylint: disable=import-error,import-outside-toplevel
+        pudb.set_trace()
+    elif args.debugpy:
+        import debugpy # pylint: disable=import-error,import-outside-toplevel
+        debugpy.listen(args.debugpy) # Specify port to listen (by default on localhost)
+        LOGGER.info("Waiting for debugger attach on port %d", args.debugpy)
+        debugpy.wait_for_client() # Wait for the StudioCode debugger to attach
+        debugpy.breakpoint() # Configure a first breakpoint once Attach
+
+    with open(Constants.PICKLE_BUILD_OPTIONS, "rb") as fh:
+        build_opt = pickle.load(fh)
+
+    execution_model = ExecutionModel(build_opts=build_opt)
+    execution_model.simulate()
+
+    return 0
+
+if __name__ == '__main__':
+    args = parse_args()
+
+    if args.profile:
+        profile_filename = "exec_model_profile.out"
+        import cProfile
+        cProfile.run("sys.exit(main())", profile_filename)
+        import pstats
+        p = pstats.Stats(profile_filename)
+        p.sort_stats('tottime').print_stats()
+    else:
+        sys.exit(main())

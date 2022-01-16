@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""
+Debug helper for GenASM-MP
+
+Given a test name, parse printed log and open gvim instance with tarmac/source
+code side by side. If the test failed, open tarmac of failing CPU and jump to
+test_failed* call, otherwise open tarmac of CPU0.
+"""
+
+import os
+import sys
+import re
+import shlex
+import argparse
+import subprocess
+
+from lib_gmp.test_history import get_last_test_name, set_last_test_name
+
+def main(args):
+    """
+    main function parsing fastsim log and starting gvim
+
+    @param args: named tuple with command line arguments
+    """
+    test_name = args.name or get_last_test_name(args.dir)
+    test_path = os.path.join(os.environ.get("POPEYE_HOME"), args.dir, "tests", test_name)
+
+    if args.update_history:
+        set_last_test_name(args.dir, test_name)
+
+    # REVISIT(remsau01, GENMP, support other editors?)
+    editor = "gvim" if "DISPLAY" in os.environ else "vim"
+
+    # REVISIT(remsau01, GENMP, how to open alt source file when fail is in AArch32?)
+    source_file = os.path.join(test_path, "test.a64.s")
+    assert os.path.exists(source_file), "Couldn't find test source"
+    command_l = [editor, source_file]
+
+    fastsim_log_file = os.path.join(test_path, "fastsim.log")
+
+    if os.path.exists(fastsim_log_file):
+        test_failed = False
+        with open(fastsim_log_file) as log_fd:
+            # REVISIT(remsau01, GENMP, handle other platforms than fastsim that may not have same CPU identifiers)
+            cpu_name = re.compile(r"CPU(?P<cluster>\d).(?P<cpu>\d):")
+
+            for line in log_fd:
+                match = cpu_name.search(line)
+                if match:
+                    if sys.stdout.isatty():
+                        cpu_num = int(match.group("cpu"))
+                        print("\033[0;{:d}m{:s}\033[0m".format(31 + cpu_num, line), end="")
+                    else:
+                        print(line, end="")
+                if "** TEST FAILED **" in line:
+                    assert match is not None, "Couldn't find CPU identifier in fail line"
+                    cpu_id = match.group("cpu")
+                    test_failed = True
+                    break
+            else:
+                # No fail was detected, open tarmac of specified CPU (first by default)
+                cpu_id = args.cpu
+
+        # REVISIT(remsau01, GENMP, some tarmac plugins/platforms don't have the same filename format)
+        tarmac_file = os.path.join(test_path, "fastsim.tarmac.cpu.cpu{}.log".format(cpu_id))
+
+        if os.path.exists(tarmac_file):
+            width, height = os.get_terminal_size()
+            split_command = "vsplit" if not args.hz and (width > 160 or (width / 2) > (height - 1) * 2) else "split"
+            command_l += ["-c", ":{} {}".format(split_command, tarmac_file)]
+
+            if test_failed:
+                command_l += ["-c", "/test_failed"]
+
+    if args.verbose:
+        print(" ".join(shlex.quote(arg) for arg in command_l))
+
+    subprocess.call(command_l)
+
+def get_args():
+    """
+    helper function to instantiate an L{ArgumentParser}
+
+    @return: a L{namedtuple} instance containing the parsed command line options
+    """
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("name", nargs="?", help="Test to debug. If none given, use last generated test")
+    parser.add_argument("--dir", default="genasm_mp", help="Subdirectory containing all generated files")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--cpu", default=0, help="If test didn't fail, specify which tarmac to open")
+    parser.add_argument("--hz", action="store_true", help="split the files in horizontal")
+    parser.add_argument("--update_history", action="store_true", help="update history file with this test name")
+
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    main(get_args())

@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+
+"""
+helper tool to turn a binary `popeye.elf' file into an "image68" file.
+"""
+
+import argparse
+from struct import unpack_from, pack
+import sys
+
+from lib_generator.popeye_factory import get_factory
+from lib_generator.elf import ElfReader
+from lib_shared.elf2json import parse_elf
+
+def main(args): # pylint: disable=too-many-locals, too-many-statements, too-many-branches
+    "main function to turn the config, trs (with index) and data section into a json representation"
+
+    elf_reader = ElfReader(args.elf)
+    factory = get_factory(args.project)
+    imp_def_const = factory.get_imp_def_const()
+
+    data_secure = {}
+    data_non_secure = {}
+    data_realm = {}
+    data_root = {}
+
+    image68 = args.image68
+    ns_mask = 1 << imp_def_const.NS_BIT_POSITION
+    nse_mask = 1 << imp_def_const.NS_BIT_POSITION + 1
+
+    for segment_index, segment_meta in enumerate(elf_reader.get_all_segment_meta()):
+        nse_bit = bool(segment_meta.p_flags & (1 << 30))
+        ns_bit = bool(segment_meta.p_flags & (1 << 31))
+        segment_data = elf_reader.get_segment_data(segment_index)
+        segment_start = segment_meta.p_paddr
+        segment_end = segment_start + len(segment_data)
+        if nse_bit and not ns_bit:
+            data = data_root
+        elif nse_bit and ns_bit:
+            data = data_realm
+        elif not nse_bit and ns_bit:
+            data = data_non_secure
+        else:
+            data = data_secure
+
+        segment_pad_start = segment_start % 8
+        if segment_pad_start:
+            start_address = segment_start - segment_pad_start
+            default_start_data = data.get(start_address)
+            if default_start_data is None:
+                default_start_data = pack("Q", imp_def_const.get_default_value_l3((nse_mask if nse_bit else 0) | (ns_mask if ns_bit else 0) |
+                                                                                  (segment_start - segment_pad_start)))
+            segment_data = default_start_data[:segment_pad_start] + segment_data
+            segment_start -= segment_pad_start
+
+        segment_pad_end = len(segment_data) % 8
+        if segment_pad_end:
+            end_address = segment_end - segment_pad_end
+            default_end_data = data.get(end_address)
+            if default_end_data is None:
+                default_end_data = pack("Q", imp_def_const.get_default_value_l3((nse_mask if nse_bit else 0) | (ns_mask if ns_bit else 0) |
+                                                                                (segment_end - segment_pad_end)))
+            segment_data += default_end_data[segment_pad_end:]
+
+        for segment_offset in range(0, len(segment_data), 8):
+            address = segment_start + segment_offset
+            data[address] = segment_data[segment_offset:segment_offset + 8]
+
+    next_address = None
+    for address in sorted(data_secure):
+        if address != next_address:
+            image68.write("1{0:016x}\n".format(address))
+        image68.write("0{0:016x}\n".format(unpack_from("Q", data_secure[address])[0]))
+        next_address = address + 8
+
+    next_address = None
+    for address in sorted(data_non_secure):
+        if address != next_address:
+            image68.write("1{0:016x}\n".format(address | ns_mask))
+        image68.write("0{0:016x}\n".format(unpack_from("Q", data_non_secure[address])[0]))
+        next_address = address + 8
+
+    next_address = None
+    for address in sorted(data_realm):
+        if address != next_address:
+            image68.write("1{0:016x}\n".format(address | ns_mask | nse_mask))
+        image68.write("0{0:016x}\n".format(unpack_from("Q", data_realm[address])[0]))
+        next_address = address + 8
+
+    next_address = None
+    for address in sorted(data_root):
+        if address != next_address:
+            image68.write("1{0:016x}\n".format(address | nse_mask))
+        image68.write("0{0:016x}\n".format(unpack_from("Q", data_root[address])[0]))
+        next_address = address + 8
+
+    image68.write("2{0:016x}\n".format(0)) # End of the memory init
+
+    ranges_physical = parse_elf(args.elf)["ranges"]
+    range_physical_s = ranges_physical[".range.physical_s"]
+    range_physical_ns = ranges_physical[".range.physical_ns"]
+    range_physical_root = ranges_physical.get(".range.physical_root", {})
+    range_physical_realm = ranges_physical.get(".range.physical_realm", {})
+    for tag_value in range(0, 16):
+        for range_physical, mask in ((range_physical_s, 0),
+                                     (range_physical_ns, ns_mask),
+                                     (range_physical_root, nse_mask),
+                                     (range_physical_realm, ns_mask | nse_mask)):
+            if range_physical:
+                for range_address in range_physical["mpe_tag_{}".format(tag_value)]:
+                    start_address, size = range_address
+                    image68.write("1{0:016x}\n".format(start_address | mask))
+                    for address in range(start_address, start_address + size, 8):
+                        image68.write("0{0:015x}\n".format(sum(tag_value << (8 * n) for n in range(8))))
+
+    image68.write("2{0:016x}\n".format(0)) # End of the tag init
+
+    return False
+
+def get_args():
+    "parses the command line arguments and returns them in a named tuple"
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--elf",
+                        type=argparse.FileType('r'),
+                        required=True)
+    parser.add_argument("--image68",
+                        type=argparse.FileType('w'),
+                        required=True)
+    parser.add_argument("--project",
+                        type=str,
+                        required=True)
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    sys.exit(main(get_args()))
